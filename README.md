@@ -66,6 +66,44 @@ Semantics worth knowing:
   immediately; the load itself finishes detached and populates the cache.
 - `Set` with `ttl <= 0` uses the configured `DefaultTTL` (or no expiry).
 
+## Production knobs
+
+```go
+cache := cachekit.New(
+    cachekit.WithAddr("localhost:6379"),
+    cachekit.WithDefaultTTL(5*time.Minute),
+
+    // Avalanche: spread TTLs ±10% so co-written keys don't expire together.
+    cachekit.WithTTLJitter(0.1),
+
+    // Penetration: cache "does not exist" for 30s. Loaders signal it by
+    // returning an error wrapping cachekit.ErrNotFound; GetOrSet then
+    // serves ErrNotFound without touching the DB until the entry expires.
+    cachekit.WithNegativeTTL(30*time.Second),
+
+    // A slow cache is worse than a down one: bound every cache operation
+    // (never the loader) with its own deadline.
+    cachekit.WithOpTimeout(50*time.Millisecond),
+)
+```
+
+## Batch reads
+
+`GetOrSetMany` loads N keys with one cache round trip (MGET / pipelined)
+and one loader call for whichever keys are missing:
+
+```go
+users, err := cachekit.GetOrSetMany(ctx, cache,
+    []string{"user:1", "user:2", "user:3"}, time.Minute,
+    func(ctx context.Context, missing []string) (map[string]User, error) {
+        return loadUsersFromDB(ctx, missing) // called only for cache misses
+    })
+```
+
+Keys the loader omits are absent from the result (and negative-cached when
+`WithNegativeTTL` is set). Note: batch loads are not single-flighted —
+that protection currently applies to per-key `GetOrSet` only.
+
 ## Observability
 
 Wire `Hooks` to your metrics — especially `OnError`, which also fires for

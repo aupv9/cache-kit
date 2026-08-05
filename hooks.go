@@ -32,7 +32,9 @@ type Hooks struct {
 	OnError func(op Op, key string, err error)
 	// OnLoad fires after every GetOrSet loader invocation with its
 	// duration and outcome. Loader calls are the cache's whole reason to
-	// exist — this is the number to alert on.
+	// exist — this is the number to alert on. For batch loads
+	// (GetOrSetMany) it fires once per missing key, all with the batch's
+	// duration and outcome.
 	OnLoad func(key string, dur time.Duration, err error)
 }
 
@@ -60,17 +62,25 @@ func (h Hooks) load(key string, dur time.Duration, err error) {
 	}
 }
 
-// hooked is implemented by backends so GetOrSet can report loader and
-// decode events through the same Hooks the backend was configured with.
-type hooked interface {
-	cacheHooks() Hooks
+// cacheConfig is the per-cache configuration the GetOrSet helpers need
+// beyond the Cache interface itself.
+type cacheConfig struct {
+	hooks       Hooks
+	negativeTTL time.Duration
 }
 
-// hooksOf returns c's configured Hooks, or a no-op zero value for
-// third-party Cache implementations.
-func hooksOf(c Cache) Hooks {
-	if h, ok := c.(hooked); ok {
-		return h.cacheHooks()
+// configured is implemented by backends so GetOrSet can report loader and
+// decode events through the same Hooks the backend was configured with,
+// and honor cache-level settings like the negative-caching TTL.
+type configured interface {
+	cachekitConfig() cacheConfig
+}
+
+// configOf returns c's configuration, or a zero value (no-op hooks,
+// negative caching off) for third-party Cache implementations.
+func configOf(c Cache) cacheConfig {
+	if p, ok := c.(configured); ok {
+		return p.cachekitConfig()
 	}
-	return Hooks{}
+	return cacheConfig{}
 }

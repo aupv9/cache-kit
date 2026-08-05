@@ -20,6 +20,8 @@ Do not add tests that dial a real server.
 | File         | Role |
 |--------------|------|
 | `cache.go`   | `Cache` interface, `ErrCacheMiss`, generic `GetOrSet` (cache-aside) |
+| `batch.go`   | `BatchCache` optional interface, generic `GetOrSetMany` |
+| `negative.go`| `ErrNotFound` + negative-entry marker (cache penetration defense) |
 | `redis.go`   | `RedisCache` — go-redis v9 backend, works with both Redis and Valkey (RESP) |
 | `valkey.go`  | `ValkeyCache` — valkey-go backend: auto-pipelining, optional server-assisted client-side caching (`WithClientSideCacheTTL`) |
 | `memory.go`  | `MemoryCache` — process-local map, TTL via lazy expiry; tests/dev/L1 only |
@@ -61,6 +63,20 @@ be added there.
   the initiator's cancellation but keeps its deadline and values.
 - **Prefixing** happens inside the backend (`RedisCache.key`); public API
   keys are always logical (unprefixed).
+- **Negative caching is opt-in and marker-based**: with `WithNegativeTTL`,
+  a loader error wrapping `ErrNotFound` (or a key omitted by a batch
+  loader) stores `negativeMarker`; the GetOrSet helpers translate it back
+  to `ErrNotFound`. The marker is checked *before* any decode so it never
+  triggers the decode self-heal. `ErrNotFound` ≠ `ErrCacheMiss` — never
+  conflate them.
+- **TTL resolution order** in every backend: explicit ttl → `DefaultTTL` →
+  jitter (`WithTTLJitter`) → backend clamps (valkey PX ≥ 1ms). Batch and
+  single-key writes must share this path (`ttlFor`/`newItem`).
+- **OpTimeout bounds cache ops only** (`opContext` in each backend op) —
+  never the GetOrSet loader.
+- **Batch loads are not single-flighted** (documented in `GetOrSetMany`);
+  batch reads degrade to "all missing" on infra failure, batch writes are
+  best-effort.
 
 ## Adding a new backend (e.g. valkey-go, in-memory)
 

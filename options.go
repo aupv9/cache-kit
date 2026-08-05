@@ -1,6 +1,10 @@
 package cachekit
 
-import "time"
+import (
+	"context"
+	"math/rand/v2"
+	"time"
+)
 
 // Options configures a cache backend. Zero values are usable defaults:
 // localhost:6379, no prefix, no default TTL, JSON codec.
@@ -30,6 +34,21 @@ type Options struct {
 	// Hooks receives hit/miss/error/loader events for metrics and logging.
 	// See the Hooks type; the zero value disables everything.
 	Hooks Hooks
+	// TTLJitter spreads every stored TTL uniformly within ±(fraction ×
+	// TTL), so keys written together don't all expire together (cache
+	// avalanche). 0.1 means ±10%. Zero disables; values are capped at 0.9.
+	TTLJitter float64
+	// NegativeTTL enables negative caching in GetOrSet/GetOrSetMany: when
+	// the loader reports ErrNotFound (or, for batch loads, omits a key),
+	// that absence is cached for this duration and served as ErrNotFound
+	// without re-invoking the loader. Zero disables negative caching.
+	NegativeTTL time.Duration
+	// OpTimeout bounds each individual cache operation (Get/Set/Delete/
+	// batch/Ping) with its own deadline, so a slow cache can't hold
+	// requests hostage — a slow cache is worse than a down one. It does
+	// not bound GetOrSet loaders. Zero means no per-op deadline. Ignored
+	// by MemoryCache.
+	OpTimeout time.Duration
 }
 
 // Option mutates Options in the functional-options style.
@@ -47,6 +66,11 @@ func WithClientSideCacheTTL(d time.Duration) Option {
 	return func(o *Options) { o.ClientSideCacheTTL = d }
 }
 func WithHooks(h Hooks) Option { return func(o *Options) { o.Hooks = h } }
+func WithTTLJitter(fraction float64) Option {
+	return func(o *Options) { o.TTLJitter = fraction }
+}
+func WithNegativeTTL(d time.Duration) Option { return func(o *Options) { o.NegativeTTL = d } }
+func WithOpTimeout(d time.Duration) Option   { return func(o *Options) { o.OpTimeout = d } }
 
 func buildOptions(opts []Option) Options {
 	o := Options{Addr: "localhost:6379"}
@@ -56,5 +80,30 @@ func buildOptions(opts []Option) Options {
 	if o.Codec == nil {
 		o.Codec = defaultCodec
 	}
+	if o.TTLJitter < 0 {
+		o.TTLJitter = 0
+	}
+	if o.TTLJitter > 0.9 {
+		o.TTLJitter = 0.9
+	}
 	return o
+}
+
+// applyJitter spreads ttl uniformly within ±(frac × ttl). No-op for
+// non-positive ttl (no expiry / default already resolved) or frac.
+func applyJitter(ttl time.Duration, frac float64) time.Duration {
+	if ttl <= 0 || frac <= 0 {
+		return ttl
+	}
+	delta := (rand.Float64()*2 - 1) * frac // uniform in [-frac, +frac)
+	return time.Duration(float64(ttl) * (1 + delta))
+}
+
+// opContext bounds a single cache operation with its own deadline when
+// the backend is configured with WithOpTimeout.
+func opContext(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
 }

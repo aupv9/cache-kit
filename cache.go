@@ -50,7 +50,12 @@ func IsMiss(err error) bool {
 // entry that fails to decode (corrupted, or written by an incompatible
 // schema version) is also treated as a miss: the entry is deleted and the
 // loader repopulates it, instead of the key erroring until TTL expiry.
-// Values are encoded with codec (nil means the package default, JSON).
+//
+// If the loader returns an error wrapping ErrNotFound and the cache is
+// configured with WithNegativeTTL, the absence itself is cached: further
+// calls return ErrNotFound without invoking the loader until the negative
+// entry expires. Values are encoded with codec (nil means the package
+// default, JSON).
 func GetOrSet[T any](ctx context.Context, c Cache, key string, ttl time.Duration, loader func(context.Context) (T, error)) (T, error) {
 	return GetOrSetWithCodec(ctx, c, key, ttl, defaultCodec, loader)
 }
@@ -61,9 +66,13 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 	if codec == nil {
 		codec = defaultCodec
 	}
-	hooks := hooksOf(c)
+	cfg := configOf(c)
+	hooks := cfg.hooks
 
 	if data, err := c.Get(ctx, key); err == nil {
+		if isNegativeEntry(data) {
+			return zero, fmt.Errorf("%w: %s", ErrNotFound, key)
+		}
 		var v T
 		uerr := codec.Unmarshal(data, &v)
 		if uerr == nil {
@@ -93,6 +102,9 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 
 		// Another flight may have populated the key while we waited.
 		if data, err := c.Get(fctx, key); err == nil {
+			if isNegativeEntry(data) {
+				return data, nil // resolved after the flight
+			}
 			var probe T
 			uerr := codec.Unmarshal(data, &probe)
 			if uerr == nil {
@@ -107,6 +119,14 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 		v, err := loader(fctx)
 		hooks.load(key, time.Since(start), err)
 		if err != nil {
+			// Negative caching: "does not exist" is a valid, cacheable
+			// answer — store it so hot lookups of nonexistent entities
+			// stop reaching the database. Other loader errors propagate
+			// and are never cached.
+			if cfg.negativeTTL > 0 && errors.Is(err, ErrNotFound) {
+				_ = c.Set(fctx, key, negativeMarker, cfg.negativeTTL)
+				return negativeMarker, nil
+			}
 			return nil, err
 		}
 		data, err := codec.Marshal(v)
@@ -120,6 +140,9 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 	})
 	if err != nil {
 		return zero, err
+	}
+	if isNegativeEntry(data) {
+		return zero, fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
 
 	var v T
