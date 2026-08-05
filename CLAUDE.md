@@ -88,12 +88,26 @@ be added there.
   best-effort.
 - **Envelope order**: negative marker check → envelope parse → decode, on
   every read path. The envelope is written only when `WithStaleTTL` or
-  `WithEarlyRefresh` is set; bare bytes always parse as "no metadata,
-  fresh until backend TTL" (back-compat with pre-envelope entries).
+  `WithEarlyRefresh` is set, and *parsed* only then too
+  (`cacheConfig.parseStored`) — with the features off, values are opaque
+  bytes even if they start with the magic. Bare bytes always parse as
+  "no metadata, fresh until backend TTL" (back-compat); disabling the
+  features later makes old enveloped entries self-heal once.
+- **Jitter lands on the freshness window, never the total**: enveloped
+  writes are jittered inside `packForStore` and backends skip jitter for
+  them (`hasEnvelope`), so `freshUntil + staleTTL == backend expiry`
+  holds exactly. Re-jittering the total could cut it below `freshUntil`
+  and silently delete the stale window.
 - **Stale serves never block**: a stale hit returns immediately and
   triggers `refreshAsync` (deduped through the same single-flight group
   as misses; failures keep the stale entry). Background refreshes drop
-  the initiator's deadline; synchronous flights keep it. `GetOrSetMany`
+  the initiator's deadline but are bounded by freshness + stale window
+  (hung loaders must not pin goroutines forever), and their failures —
+  including panics — fire `OnError(OpRefresh)`, their only visibility.
+  A refresh flight's re-check only accepts an entry *fresher than the
+  one that triggered it* (`flightOpts.refreshOf`), otherwise an early
+  refresh would short-circuit on its own fresh entry and never reload.
+  Synchronous flights keep the initiator's deadline. `GetOrSetMany`
   serves stale without refreshing (hard TTL bounds staleness).
 
 ## Adding a new backend (e.g. valkey-go, in-memory)

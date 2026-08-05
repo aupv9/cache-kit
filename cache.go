@@ -83,7 +83,7 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 		if isNegativeEntry(data) {
 			return zero, fmt.Errorf("%w: %s", ErrNotFound, key)
 		}
-		env, payload := parseEnvelope(data)
+		env, payload := cfg.parseStored(data)
 		var v T
 		uerr := codec.Unmarshal(payload, &v)
 		if uerr == nil {
@@ -93,11 +93,11 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 				// Stale-while-revalidate: serve the stale value with no
 				// loader latency on the request path; a deduplicated
 				// background refresh replaces the entry.
-				refreshAsync(ctx, c, key, ttl, codec, loader, cfg)
+				refreshAsync(ctx, c, key, ttl, codec, loader, cfg, env)
 			case env.shouldEarlyRefresh(now, cfg.earlyRefreshBeta):
 				// Probabilistic early refresh near the freshness
 				// deadline: spreads reloads across time and instances.
-				refreshAsync(ctx, c, key, ttl, codec, loader, cfg)
+				refreshAsync(ctx, c, key, ttl, codec, loader, cfg, env)
 			}
 			return v, nil
 		}
@@ -111,11 +111,11 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 	}
 
 	// Miss (or degraded cache): load through the single-flight group so
-	// only one goroutine per (cache, key) hits the source of truth.
-	// preserveDeadline: the flight is detached from the initiator's
-	// cancellation but keeps its deadline.
+	// only one goroutine per (cache, key) hits the source of truth. The
+	// flight is detached from the initiator's cancellation but keeps its
+	// deadline.
 	data, err := loadGroup.do(ctx, flightKey(c, key),
-		loadAndStore(ctx, true, c, key, ttl, codec, loader, cfg))
+		loadAndStore(ctx, c, key, ttl, codec, loader, cfg, flightOpts{preserveDeadline: true}))
 	if err != nil {
 		return zero, err
 	}
@@ -123,7 +123,7 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 		return zero, fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
 
-	_, payload := parseEnvelope(data)
+	_, payload := cfg.parseStored(data)
 	var v T
 	if uerr := codec.Unmarshal(payload, &v); uerr != nil {
 		// The flight validated or produced these bytes, so this is either
@@ -135,36 +135,61 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 	return v, nil
 }
 
+// flightOpts controls how a loadAndStore flight derives its context and
+// when a re-checked entry satisfies it.
+type flightOpts struct {
+	// preserveDeadline keeps the initiator's deadline (synchronous miss
+	// path). Background refreshes leave it false so they aren't cut
+	// short by the request that happened to trigger them.
+	preserveDeadline bool
+	// timeout bounds the flight with its own deadline (background
+	// refreshes; zero means none). Without it a hung loader would pin
+	// its goroutine forever and every stale hit would join the stuck
+	// flight, growing memory without bound.
+	timeout time.Duration
+	// refreshOf is the freshness deadline of the entry that triggered a
+	// refresh flight: the re-check only satisfies the flight if it finds
+	// a strictly fresher entry (someone else already refreshed). Zero —
+	// the miss path — accepts any fresh entry. Without this, an early
+	// refresh would find its own still-fresh entry and become a no-op.
+	refreshOf time.Time
+}
+
 // loadAndStore builds the single-flight function shared by the miss path
 // and background refreshes: re-check the cache, run the loader, store the
 // result (enveloped when stale-while-revalidate / early refresh is on),
 // and return the stored bytes.
 //
 // The returned function derives its own context from base when it runs:
-// detached from cancellation, keeping values, and — only when
-// preserveDeadline is set (the synchronous miss path) — the base deadline.
-// Background refreshes pass false so they aren't cut short by the request
-// that happened to trigger them.
-func loadAndStore[T any](base context.Context, preserveDeadline bool, c Cache, key string, ttl time.Duration, codec Codec, loader func(context.Context) (T, error), cfg cacheConfig) func() ([]byte, error) {
+// detached from cancellation, keeping values, with the deadline governed
+// by opts.
+func loadAndStore[T any](base context.Context, c Cache, key string, ttl time.Duration, codec Codec, loader func(context.Context) (T, error), cfg cacheConfig, opts flightOpts) func() ([]byte, error) {
 	return func() ([]byte, error) {
 		fctx := context.WithoutCancel(base)
-		if preserveDeadline {
+		if opts.preserveDeadline {
 			if deadline, ok := base.Deadline(); ok {
 				var cancel context.CancelFunc
 				fctx, cancel = context.WithDeadline(fctx, deadline)
 				defer cancel()
 			}
 		}
+		if opts.timeout > 0 {
+			var cancel context.CancelFunc
+			fctx, cancel = context.WithTimeout(fctx, opts.timeout)
+			defer cancel()
+		}
 
 		// Another flight may have populated the key while we waited. A
-		// stale entry does not satisfy the flight — refreshing it is
-		// exactly this flight's job.
+		// stale entry never satisfies the flight — refreshing it is
+		// exactly this flight's job — and a refresh flight additionally
+		// requires an entry fresher than the one that triggered it.
 		if data, err := c.Get(fctx, key); err == nil {
 			if isNegativeEntry(data) {
 				return data, nil // resolved after the flight
 			}
-			env, payload := parseEnvelope(data)
-			if !env.stale(time.Now()) {
+			env, payload := cfg.parseStored(data)
+			refreshed := opts.refreshOf.IsZero() || env.freshUntil.After(opts.refreshOf)
+			if !env.stale(time.Now()) && refreshed {
 				var probe T
 				uerr := codec.Unmarshal(payload, &probe)
 				if uerr == nil {
@@ -193,6 +218,7 @@ func loadAndStore[T any](base context.Context, preserveDeadline bool, c Cache, k
 		}
 		payload, merr := codec.Marshal(v)
 		if merr != nil {
+			cfg.hooks.error(OpEncode, key, merr)
 			return nil, fmt.Errorf("cachekit: encode %q: %w", key, merr)
 		}
 		data, storeTTL := packForStore(payload, ttl, loadDur, cfg)
@@ -203,19 +229,49 @@ func loadAndStore[T any](base context.Context, preserveDeadline bool, c Cache, k
 	}
 }
 
-// refreshAsync starts (or joins) a background refresh flight for key.
-// It never blocks: concurrent triggers share one loader call through the
-// same single-flight group as the miss path, and its failures leave the
-// existing (stale) entry in place until hard expiry.
-func refreshAsync[T any](ctx context.Context, c Cache, key string, ttl time.Duration, codec Codec, loader func(context.Context) (T, error), cfg cacheConfig) {
-	loadGroup.doAsync(flightKey(c, key),
-		loadAndStore(ctx, false, c, key, ttl, codec, loader, cfg))
+// refreshAsync starts (or joins) a background refresh flight for the
+// entry described by env. It never blocks: concurrent triggers share one
+// loader call through the same single-flight group as the miss path.
+// Failures leave the existing (stale) entry in place until hard expiry
+// and are reported through Hooks.OnError with OpRefresh — nothing waits
+// on these flights, so that hook is their only visibility.
+func refreshAsync[T any](ctx context.Context, c Cache, key string, ttl time.Duration, codec Codec, loader func(context.Context) (T, error), cfg cacheConfig, env envelope) {
+	// Bound the flight by the entry's total lifetime: past hard expiry a
+	// plain miss would reload anyway, so a slower refresh helps nobody.
+	fresh := ttl
+	if fresh <= 0 {
+		fresh = cfg.defaultTTL
+	}
+	timeout := fresh + cfg.staleTTL
+	if timeout <= 0 {
+		timeout = time.Minute // never-expiring entries still get a bound
+	}
+	inner := loadAndStore(ctx, c, key, ttl, codec, loader, cfg,
+		flightOpts{timeout: timeout, refreshOf: env.freshUntil})
+	loadGroup.doAsync(flightKey(c, key), func() (data []byte, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("cachekit: loader panic: %v", r)
+			}
+			if err != nil {
+				cfg.hooks.error(OpRefresh, key, err)
+			}
+		}()
+		return inner()
+	})
 }
 
 // packForStore decides what bytes and TTL actually hit the backend. With
 // stale-while-revalidate or early refresh enabled, the payload is wrapped
 // in the metadata envelope and the backend TTL is extended to freshness +
 // stale window; otherwise both pass through untouched.
+//
+// TTL jitter is applied to the freshness window here — not by the backend
+// on the total — so that "freshUntil + staleTTL == backend expiry" holds
+// exactly: jittering the total could shrink it below freshUntil and
+// silently delete the stale window. Backends skip jitter for enveloped
+// values (hasEnvelope); jittering fresh also spreads the refresh burst of
+// co-written keys, not just their hard expiry.
 func packForStore(payload []byte, ttl, loadDur time.Duration, cfg cacheConfig) ([]byte, time.Duration) {
 	if !cfg.envelopeEnabled() {
 		return payload, ttl
@@ -224,6 +280,7 @@ func packForStore(payload []byte, ttl, loadDur time.Duration, cfg cacheConfig) (
 	if fresh <= 0 {
 		fresh = cfg.defaultTTL
 	}
+	fresh = applyJitter(fresh, cfg.ttlJitter)
 	var freshUntil time.Time
 	var total time.Duration
 	if fresh > 0 {

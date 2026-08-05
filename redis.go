@@ -80,14 +80,20 @@ func (c *RedisCache) cachekitConfig() cacheConfig {
 		defaultTTL:       c.defaultTTL,
 		staleTTL:         c.staleTTL,
 		earlyRefreshBeta: c.earlyBeta,
+		ttlJitter:        c.ttlJitter,
 	}
 }
 
 // ttlFor resolves the effective TTL for a write: default fallback, then
-// jitter so co-written keys don't expire together.
-func (c *RedisCache) ttlFor(ttl time.Duration) time.Duration {
+// jitter so co-written keys don't expire together. Enveloped values skip
+// jitter — packForStore already jittered their freshness window, and
+// jittering the total again could shrink it below freshUntil.
+func (c *RedisCache) ttlFor(ttl time.Duration, val []byte) time.Duration {
 	if ttl <= 0 {
 		ttl = c.defaultTTL
+	}
+	if hasEnvelope(val) {
+		return ttl
 	}
 	return applyJitter(ttl, c.ttlJitter)
 }
@@ -116,7 +122,7 @@ func (c *RedisCache) Get(ctx context.Context, key string) ([]byte, error) {
 func (c *RedisCache) Set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
 	ctx, cancel := opContext(ctx, c.opTimeout)
 	defer cancel()
-	if err := c.client.Set(ctx, c.key(key), val, c.ttlFor(ttl)).Err(); err != nil {
+	if err := c.client.Set(ctx, c.key(key), val, c.ttlFor(ttl, val)).Err(); err != nil {
 		c.hooks.error(OpSet, key, err)
 		return fmt.Errorf("cachekit: set %q: %w", key, err)
 	}
@@ -192,7 +198,7 @@ func (c *RedisCache) SetMany(ctx context.Context, items map[string][]byte, ttl t
 
 	pipe := c.client.Pipeline()
 	for k, v := range items {
-		pipe.Set(ctx, c.key(k), v, c.ttlFor(ttl))
+		pipe.Set(ctx, c.key(k), v, c.ttlFor(ttl, v))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		for k := range items {

@@ -66,6 +66,7 @@ func (c *MemoryCache) cachekitConfig() cacheConfig {
 		defaultTTL:       c.defaultTTL,
 		staleTTL:         c.staleTTL,
 		earlyRefreshBeta: c.earlyBeta,
+		ttlJitter:        c.ttlJitter,
 	}
 }
 
@@ -110,7 +111,12 @@ func (c *MemoryCache) newItem(val []byte, ttl time.Duration) memoryItem {
 	if ttl <= 0 {
 		ttl = c.defaultTTL
 	}
-	ttl = applyJitter(ttl, c.ttlJitter)
+	// Enveloped values skip jitter: packForStore already jittered their
+	// freshness window, and jittering the total again could shrink it
+	// below freshUntil.
+	if !hasEnvelope(val) {
+		ttl = applyJitter(ttl, c.ttlJitter)
+	}
 	it := memoryItem{val: bytes.Clone(val)}
 	if ttl > 0 {
 		it.deadline = c.now().Add(ttl)

@@ -41,6 +41,15 @@ func wrapEnvelope(payload []byte, freshUntil time.Time, delta time.Duration) []b
 	return append(buf, payload...)
 }
 
+// hasEnvelope reports whether stored bytes carry the metadata envelope.
+// Backends use it to skip TTL jitter on enveloped writes: packForStore
+// already jittered the freshness window, and a second jitter on the total
+// could shrink the backend TTL below freshUntil, silently deleting the
+// stale window.
+func hasEnvelope(data []byte) bool {
+	return len(data) >= envelopeHeaderLen && bytes.HasPrefix(data, envelopeMagic)
+}
+
 // parseEnvelope splits stored bytes into metadata and payload. Bytes
 // without the magic are a bare payload with no metadata.
 func parseEnvelope(data []byte) (envelope, []byte) {
@@ -76,6 +85,8 @@ func (e envelope) shouldEarlyRefresh(now time.Time, beta float64) bool {
 	if delta <= 0 {
 		delta = time.Millisecond // unknown load cost: assume cheap
 	}
-	spread := time.Duration(float64(delta) * beta * -math.Log(rand.Float64()))
+	// 1-Float64() is in (0,1]: Float64() itself can return exactly 0,
+	// and Log(0) = -Inf would overflow the Duration conversion.
+	spread := time.Duration(float64(delta) * beta * -math.Log(1-rand.Float64()))
 	return now.Add(spread).After(e.freshUntil)
 }

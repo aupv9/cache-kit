@@ -86,7 +86,7 @@ func GetOrSetManyWithCodec[T any](ctx context.Context, c Cache, keys []string, t
 		// Entries in their stale window are served as-is: batch loads
 		// have no per-key background refresh (see the doc comment); the
 		// hard TTL still bounds staleness.
-		_, payload := parseEnvelope(data)
+		_, payload := cfg.parseStored(data)
 		var v T
 		if uerr := codec.Unmarshal(payload, &v); uerr != nil {
 			cfg.hooks.error(OpDecode, k, uerr)

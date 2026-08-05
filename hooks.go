@@ -16,6 +16,11 @@ const (
 	// OpEncode fires when a loaded value fails to encode. GetOrSetMany
 	// still returns the value to the caller — it just isn't cached.
 	OpEncode Op = "encode"
+	// OpRefresh fires when a background refresh flight (stale-while-
+	// revalidate or early refresh) fails for any reason — loader error,
+	// encode failure, panic, or timeout. Nothing waits on these flights,
+	// so this hook is the only place their failures are visible.
+	OpRefresh Op = "refresh"
 )
 
 // Hooks receives cache events, for wiring metrics (hit ratio, error
@@ -73,12 +78,26 @@ type cacheConfig struct {
 	defaultTTL       time.Duration
 	staleTTL         time.Duration
 	earlyRefreshBeta float64
+	ttlJitter        float64
 }
 
 // envelopeEnabled reports whether GetOrSet stores entries with the
 // metadata envelope (needed by stale-while-revalidate and early refresh).
 func (c cacheConfig) envelopeEnabled() bool {
 	return c.staleTTL > 0 || c.earlyRefreshBeta > 0
+}
+
+// parseStored splits stored bytes into metadata and payload. Envelope
+// parsing is gated on the feature being enabled: a cache that never opted
+// in must treat every byte of the value as payload, even ones that happen
+// to start with the envelope magic. (Consequence: disabling SWR/early
+// refresh after enabling it makes old enveloped entries fail decode and
+// self-heal — they are deleted and reloaded once.)
+func (c cacheConfig) parseStored(data []byte) (envelope, []byte) {
+	if !c.envelopeEnabled() {
+		return envelope{}, data
+	}
+	return parseEnvelope(data)
 }
 
 // configured is implemented by backends so GetOrSet can report loader and

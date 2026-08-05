@@ -102,17 +102,21 @@ func (c *ValkeyCache) cachekitConfig() cacheConfig {
 		defaultTTL:       c.defaultTTL,
 		staleTTL:         c.staleTTL,
 		earlyRefreshBeta: c.earlyBeta,
+		ttlJitter:        c.ttlJitter,
 	}
 }
 
-// ttlFor resolves the effective TTL for a write: default fallback, jitter,
-// then the PX floor — PX truncates to milliseconds and servers reject
-// "PX 0", so sub-millisecond TTLs round up like go-redis does.
-func (c *ValkeyCache) ttlFor(ttl time.Duration) time.Duration {
+// ttlFor resolves the effective TTL for a write: default fallback, jitter
+// (skipped for enveloped values — packForStore already jittered their
+// freshness window), then the PX floor — PX truncates to milliseconds and
+// servers reject "PX 0", so sub-millisecond TTLs round up like go-redis.
+func (c *ValkeyCache) ttlFor(ttl time.Duration, val []byte) time.Duration {
 	if ttl <= 0 {
 		ttl = c.defaultTTL
 	}
-	ttl = applyJitter(ttl, c.ttlJitter)
+	if !hasEnvelope(val) {
+		ttl = applyJitter(ttl, c.ttlJitter)
+	}
 	if ttl > 0 && ttl < time.Millisecond {
 		ttl = time.Millisecond
 	}
@@ -122,7 +126,7 @@ func (c *ValkeyCache) ttlFor(ttl time.Duration) time.Duration {
 // setCmd builds a SET with the resolved TTL.
 func (c *ValkeyCache) setCmd(key string, val []byte, ttl time.Duration) valkey.Completed {
 	b := c.client.B().Set().Key(c.key(key)).Value(valkey.BinaryString(val))
-	if ttl = c.ttlFor(ttl); ttl > 0 {
+	if ttl = c.ttlFor(ttl, val); ttl > 0 {
 		return b.Px(ttl).Build()
 	}
 	return b.Build()

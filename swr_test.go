@@ -81,6 +81,160 @@ func TestXFetchBounds(t *testing.T) {
 	}
 }
 
+// With beta this large, shouldEarlyRefresh fires on essentially every hit
+// — the test then requires the background flight to actually reload,
+// which is exactly what a fresh-entry short-circuit in the flight's
+// re-check would break.
+func TestEarlyRefreshActuallyRefreshes(t *testing.T) {
+	c := NewMemory(WithEarlyRefresh(1e9))
+	ctx := context.Background()
+
+	var calls atomic.Int32
+	load := func(context.Context) (user, error) {
+		return user{ID: int(calls.Add(1)), Name: "v"}, nil
+	}
+	if _, err := GetOrSet(ctx, c, "k", time.Minute, load); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+
+	// A single fresh hit: must serve v1 and trigger an early refresh.
+	u, err := GetOrSet(ctx, c, "k", time.Minute, load)
+	if err != nil || u.ID != 1 {
+		t.Fatalf("fresh hit = %+v, %v (must serve current value)", u, err)
+	}
+
+	// The refresh must replace the entry with v2 and a later freshUntil.
+	first, _ := c.Get(ctx, "k")
+	env1, _ := parseEnvelope(first)
+	deadline := time.After(2 * time.Second)
+	for {
+		raw, err := c.Get(ctx, "k")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		env2, payload := parseEnvelope(raw)
+		var v user
+		if err := (JSONCodec{}).Unmarshal(payload, &v); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if v.ID == 2 {
+			// freshUntil has millisecond resolution; a fast refresh can
+			// land in the same instant, but must never move it backward.
+			if env2.freshUntil.Before(env1.freshUntil) {
+				t.Fatal("refresh moved freshUntil backward")
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("early refresh never reloaded (still %+v) — flight short-circuited on the fresh entry", v)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// Jitter must land on the freshness window (inside the envelope), never a
+// second time on the backend TTL: otherwise the backend expiry can drop
+// below freshUntil and silently delete the stale window.
+func TestSWRJitterPreservesStaleWindow(t *testing.T) {
+	const stale = 10 * time.Second
+	c, mr := newTestCache(t, WithDefaultTTL(time.Minute), WithStaleTTL(stale), WithTTLJitter(0.5))
+	ctx := context.Background()
+
+	before := time.Now()
+	if _, err := GetOrSet(ctx, c, "k", 0, func(context.Context) (user, error) {
+		return user{ID: 1, Name: "v"}, nil
+	}); err != nil {
+		t.Fatalf("GetOrSet: %v", err)
+	}
+
+	raw, err := c.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	env, _ := parseEnvelope(raw)
+	fresh := env.freshUntil.Sub(before)
+	if fresh < 30*time.Second-2*time.Second || fresh > 90*time.Second+2*time.Second {
+		t.Fatalf("freshness window %v outside jitter bounds [30s, 90s]", fresh)
+	}
+
+	const tolerance = 2 * time.Second
+	backendTTL := mr.TTL("k")
+	if diff := backendTTL - (fresh + stale); diff < -tolerance || diff > tolerance {
+		t.Fatalf("backend TTL %v != freshness %v + stale %v — total was re-jittered", backendTTL, fresh, stale)
+	}
+}
+
+func TestRefreshFailuresFireOpRefresh(t *testing.T) {
+	for name, loader := range map[string]func(context.Context) (user, error){
+		"error": func(context.Context) (user, error) {
+			return user{}, errors.New("db down")
+		},
+		"panic": func(context.Context) (user, error) {
+			panic("refresh exploded")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := &hookCounters{}
+			c := NewMemory(WithStaleTTL(5*time.Second), WithHooks(rec.hooks()))
+			ctx := context.Background()
+
+			if _, err := GetOrSet(ctx, c, "k", 30*time.Millisecond, func(context.Context) (user, error) {
+				return user{ID: 1, Name: "v1"}, nil
+			}); err != nil {
+				t.Fatalf("initial load: %v", err)
+			}
+			time.Sleep(60 * time.Millisecond)
+
+			u, err := GetOrSet(ctx, c, "k", 30*time.Millisecond, loader)
+			if err != nil || u.ID != 1 {
+				t.Fatalf("stale serve = %+v, %v", u, err)
+			}
+			deadline := time.After(2 * time.Second)
+			for !hasOp(rec.errOps(), OpRefresh) {
+				select {
+				case <-deadline:
+					t.Fatal("failed background refresh never fired OnError(OpRefresh)")
+				case <-time.After(time.Millisecond):
+				}
+			}
+		})
+	}
+}
+
+// A refresh whose loader hangs must be cut off by the flight's own bound
+// (freshness + stale window) instead of pinning its goroutine forever.
+func TestRefreshFlightIsBounded(t *testing.T) {
+	rec := &hookCounters{}
+	c := NewMemory(WithStaleTTL(50*time.Millisecond), WithHooks(rec.hooks()))
+	ctx := context.Background()
+
+	if _, err := GetOrSet(ctx, c, "k", 30*time.Millisecond, func(context.Context) (user, error) {
+		return user{ID: 1, Name: "v1"}, nil
+	}); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+
+	// The refresh loader blocks until its context is canceled — which
+	// must happen at roughly fresh+stale (80ms), not never.
+	u, err := GetOrSet(ctx, c, "k", 30*time.Millisecond, func(lctx context.Context) (user, error) {
+		<-lctx.Done()
+		return user{}, lctx.Err()
+	})
+	if err != nil || u.ID != 1 {
+		t.Fatalf("stale serve = %+v, %v", u, err)
+	}
+	deadline := time.After(3 * time.Second)
+	for !hasOp(rec.errOps(), OpRefresh) {
+		select {
+		case <-deadline:
+			t.Fatal("hung refresh was never cut off by its deadline")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 func TestStaleWhileRevalidateServesStaleAndRefreshes(t *testing.T) {
 	c := NewMemory(WithStaleTTL(5 * time.Second))
 	ctx := context.Background()
@@ -127,7 +281,7 @@ func TestStaleWhileRevalidateServesStaleAndRefreshes(t *testing.T) {
 			t.Fatalf("stale serve #%d = %+v, %v", i, u, err)
 		}
 	}
-	time.Sleep(20 * time.Millisecond) // give stray refreshes time to surface
+	time.Sleep(20 * time.Millisecond)  // give stray refreshes time to surface
 	if got := calls.Load(); got != 2 { // initial load + one refresh
 		t.Fatalf("loader calls = %d, want 2 (refresh must dedupe)", got)
 	}
