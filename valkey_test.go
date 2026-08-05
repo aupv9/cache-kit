@@ -55,6 +55,34 @@ func TestValkeyDefaultTTLApplied(t *testing.T) {
 	}
 }
 
+func TestValkeyGetOrSetFallsBackWhenCacheDown(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client, err := valkey.NewClient(valkey.ClientOption{
+		InitAddress:  []string{mr.Addr()},
+		DisableCache: true,
+		// valkey-go's default is to retry network errors until the
+		// context is done; with context.Background() the test would
+		// hang on the dead server instead of degrading.
+		DisableRetry: true,
+	})
+	if err != nil {
+		t.Fatalf("valkey.NewClient: %v", err)
+	}
+	t.Cleanup(client.Close)
+	c := NewValkeyWithClient(client)
+	mr.Close() // simulate an outage: every cache op now errors
+
+	u, err := GetOrSet(context.Background(), c, "user:3", time.Minute, func(context.Context) (user, error) {
+		return user{ID: 3, Name: "resilient"}, nil
+	})
+	if err != nil {
+		t.Fatalf("GetOrSet with cache down: %v", err)
+	}
+	if u.ID != 3 {
+		t.Fatalf("got %+v", u)
+	}
+}
+
 func TestValkeyNoTTLMeansNoExpiry(t *testing.T) {
 	c, mr := newTestValkey(t) // no DefaultTTL
 

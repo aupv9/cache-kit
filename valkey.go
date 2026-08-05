@@ -18,6 +18,13 @@ import (
 // valkey-go deduplicates concurrent cache-filling GETs on its own.
 // Note that cachekit's GetOrSet single-flight (group.go) still applies —
 // it deduplicates *loader* (database) calls, which no client can do.
+//
+// Degradation caveat: unlike go-redis (which gives up after a few
+// retries), valkey-go retries network errors until the context is done.
+// When the server is unreachable, Get/Set block for the full context
+// deadline before GetOrSet can fall through to the loader — so always
+// pass request-scoped contexts with deadlines, or inject a client built
+// with DisableRetry via NewValkeyWithClient if you prefer fail-fast.
 type ValkeyCache struct {
 	client         valkey.Client
 	prefix         string
@@ -57,8 +64,8 @@ func NewValkey(opts ...Option) (*ValkeyCache, error) {
 // NewValkeyWithClient wraps an existing valkey-go client. The caller keeps
 // ownership of the client's lifecycle; Close on the returned cache is a
 // no-op. Addr/Auth/DB options are ignored. If WithClientSideCacheTTL is
-// used here, the injected client must have been created with caching
-// enabled (valkey-go's default), or reads will fail.
+// used with a client created with DisableCache, valkey-go silently falls
+// back to plain reads — no error, just no client-side caching.
 func NewValkeyWithClient(client valkey.Client, opts ...Option) *ValkeyCache {
 	return newValkeyFromClient(client, buildOptions(opts))
 }
@@ -100,6 +107,11 @@ func (c *ValkeyCache) Get(ctx context.Context, key string) ([]byte, error) {
 func (c *ValkeyCache) Set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
 	if ttl <= 0 {
 		ttl = c.defaultTTL
+	}
+	// PX truncates to milliseconds; a sub-millisecond TTL would become
+	// "PX 0", which servers reject. Round up like go-redis does.
+	if ttl > 0 && ttl < time.Millisecond {
+		ttl = time.Millisecond
 	}
 	b := c.client.B().Set().Key(c.key(key)).Value(valkey.BinaryString(val))
 	var cmd valkey.Completed
