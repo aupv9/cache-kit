@@ -21,6 +21,12 @@ type Options struct {
 	// Codec overrides the default JSON codec for GetOrSet helpers
 	// bound to this cache (see RedisCache.Codec).
 	Codec Codec
+	// ClientSideCacheTTL enables server-assisted client-side caching on
+	// backends that support it (currently ValkeyCache): reads are served
+	// from a local LRU for at most this duration, with the server pushing
+	// invalidations on writes. Zero disables it. Ignored by backends
+	// without client-side caching.
+	ClientSideCacheTTL time.Duration
 }
 
 // Option mutates Options in the functional-options style.
@@ -32,6 +38,9 @@ func WithDB(db int) Option               { return func(o *Options) { o.DB = db }
 func WithPrefix(prefix string) Option    { return func(o *Options) { o.Prefix = prefix } }
 func WithDefaultTTL(d time.Duration) Option { return func(o *Options) { o.DefaultTTL = d } }
 func WithCodec(c Codec) Option           { return func(o *Options) { o.Codec = c } }
+func WithClientSideCacheTTL(d time.Duration) Option {
+	return func(o *Options) { o.ClientSideCacheTTL = d }
+}
 
 func buildOptions(opts []Option) Options {
 	o := Options{Addr: "localhost:6379"}

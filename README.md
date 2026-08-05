@@ -71,9 +71,30 @@ real server required:
 go test -race ./...
 ```
 
-## Swapping the client
+## Backends
 
-Everything depends on the `cachekit.Cache` interface; only `redis.go` knows
-about go-redis. To use [valkey-go](https://github.com/valkey-io/valkey-go)
-(auto-pipelining, server-assisted client-side caching) add a sibling
-implementation of the same interface — see `.claude/skills/add-backend/`.
+Everything depends on the `cachekit.Cache` interface; pick the backend that
+fits and the rest of your code doesn't change:
+
+- **`cachekit.New`** — go-redis v9. The safe default: plain RESP, works
+  with both Redis and Valkey, biggest ecosystem.
+- **`cachekit.NewValkey`** — [valkey-go](https://github.com/valkey-io/valkey-go):
+  auto-pipelining, and opt-in server-assisted client-side caching. Pass
+  `cachekit.WithClientSideCacheTTL(time.Minute)` and hot reads are served
+  from a local LRU that the server invalidates on writes (requires a server
+  with `CLIENT TRACKING`, i.e. Redis 6+/Valkey):
+
+  ```go
+  cache, err := cachekit.NewValkey(
+      cachekit.WithAddr("localhost:6379"),
+      cachekit.WithPrefix("users-svc:"),
+      cachekit.WithClientSideCacheTTL(time.Minute),
+  )
+  ```
+
+- **`cachekit.NewMemory`** — process-local map for tests, local dev, or as
+  an L1. TTL honored via lazy expiry; no eviction, so don't feed it
+  unbounded key sets.
+
+All backends pass the same conformance suite (`conformance_test.go`). To
+add another one, see `.claude/skills/add-backend/`.

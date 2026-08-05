@@ -21,13 +21,19 @@ Do not add tests that dial a real server.
 |--------------|------|
 | `cache.go`   | `Cache` interface, `ErrCacheMiss`, generic `GetOrSet` (cache-aside) |
 | `redis.go`   | `RedisCache` — go-redis v9 backend, works with both Redis and Valkey (RESP) |
+| `valkey.go`  | `ValkeyCache` — valkey-go backend: auto-pipelining, optional server-assisted client-side caching (`WithClientSideCacheTTL`) |
+| `memory.go`  | `MemoryCache` — process-local map, TTL via lazy expiry; tests/dev/L1 only |
 | `codec.go`   | `Codec` interface, `JSONCodec` default |
 | `options.go` | `Options` + functional `With*` options |
 | `group.go`   | single-flight dedup for concurrent loads of the same key |
 
 Dependency direction: everything depends on the `Cache` interface in
-`cache.go`; only `redis.go` imports a client library. Callers should hold a
-`cachekit.Cache`, not `*RedisCache`.
+`cache.go`; only `redis.go` and `valkey.go` import client libraries.
+Callers should hold a `cachekit.Cache`, not a concrete backend type.
+
+The behavioral contract is executable: `conformance_test.go` runs the same
+suite against every backend via the `backends()` table — a new backend must
+be added there.
 
 ## Invariants — do not break
 
@@ -50,9 +56,15 @@ Dependency direction: everything depends on the `Cache` interface in
 
 Use the `add-backend` skill (`.claude/skills/add-backend/`). In short: one
 new file implementing `Cache`, a `var _ Cache = (*T)(nil)` compile-time
-check, miss mapped to `ErrCacheMiss`, and the same test suite run against it.
-valkey-go note: it has built-in client-side caching + single-flight, so its
-`GetOrSet` path may bypass `group.go`.
+check, miss mapped to `ErrCacheMiss`, and an entry in `backends()` in
+`conformance_test.go` so the shared suite covers it.
+
+valkey-go notes: its built-in single-flight dedupes concurrent GETs to the
+*server*; `group.go` still applies on top because it dedupes *loader* (DB)
+calls, which no client library can. In tests, create the client with
+`DisableCache: true` — miniredis has no `CLIENT TRACKING` support, so the
+client-side-caching path (`WithClientSideCacheTTL` → `DoCache`) only works
+against a real server and stays untested by design.
 
 ## Conventions
 
