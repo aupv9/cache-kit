@@ -13,6 +13,9 @@ const (
 	// written by an incompatible schema version). GetOrSet self-heals by
 	// deleting the entry and falling back to the loader.
 	OpDecode Op = "decode"
+	// OpEncode fires when a loaded value fails to encode. GetOrSetMany
+	// still returns the value to the caller — it just isn't cached.
+	OpEncode Op = "encode"
 )
 
 // Hooks receives cache events, for wiring metrics (hit ratio, error

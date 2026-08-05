@@ -181,9 +181,9 @@ func (c *ValkeyCache) Ping(ctx context.Context) error {
 	return nil
 }
 
-// GetMany returns the values stored at keys. The GETs go out as one
-// auto-pipelined DoMulti round trip; missing keys are simply absent from
-// the result map.
+// GetMany returns the values stored at keys in one auto-pipelined round
+// trip (through the client-side cache when WithClientSideCacheTTL is
+// set, like Get). Missing keys are simply absent from the result map.
 func (c *ValkeyCache) GetMany(ctx context.Context, keys []string) (map[string][]byte, error) {
 	out := make(map[string][]byte, len(keys))
 	if len(keys) == 0 {
@@ -192,11 +192,26 @@ func (c *ValkeyCache) GetMany(ctx context.Context, keys []string) (map[string][]
 	ctx, cancel := opContext(ctx, c.opTimeout)
 	defer cancel()
 
-	cmds := make([]valkey.Completed, len(keys))
-	for i, k := range keys {
-		cmds[i] = c.client.B().Get().Key(c.key(k)).Build()
+	var results []valkey.ValkeyResult
+	if c.clientCacheTTL > 0 {
+		cmds := make([]valkey.CacheableTTL, len(keys))
+		for i, k := range keys {
+			cmds[i] = valkey.CT(c.client.B().Get().Key(c.key(k)).Cache(), c.clientCacheTTL)
+		}
+		results = c.client.DoMultiCache(ctx, cmds...)
+	} else {
+		cmds := make([]valkey.Completed, len(keys))
+		for i, k := range keys {
+			cmds[i] = c.client.B().Get().Key(c.key(k)).Build()
+		}
+		results = c.client.DoMulti(ctx, cmds...)
 	}
-	for i, res := range c.client.DoMulti(ctx, cmds...) {
+
+	// Consume every result before failing so hit/miss hooks fire per key
+	// (matching RedisCache.GetMany's per-key error accounting) — DoMulti
+	// has already paid for all responses.
+	var firstErr error
+	for i, res := range results {
 		data, err := res.AsBytes()
 		if err != nil {
 			if valkey.IsValkeyNil(err) {
@@ -204,10 +219,16 @@ func (c *ValkeyCache) GetMany(ctx context.Context, keys []string) (map[string][]
 				continue
 			}
 			c.hooks.error(OpGet, keys[i], err)
-			return nil, fmt.Errorf("cachekit: get %q: %w", keys[i], err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("cachekit: get %q: %w", keys[i], err)
+			}
+			continue
 		}
 		c.hooks.hit(keys[i])
 		out[keys[i]] = data
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return out, nil
 }

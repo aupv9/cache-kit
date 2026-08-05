@@ -2,7 +2,6 @@ package cachekit
 
 import (
 	"context"
-	"fmt"
 	"time"
 )
 
@@ -26,10 +25,12 @@ type BatchCache interface {
 //
 // The result contains an entry per key that exists; keys the loader omits
 // are simply absent (and, with WithNegativeTTL, that absence is cached so
-// they are not re-loaded until the negative entry expires). A loader error
-// fails the whole call. A broken cache degrades: read failures make every
-// key load, write failures are best-effort, and undecodable entries
-// self-heal exactly like GetOrSet.
+// they are not re-loaded until the negative entry expires). Omission is a
+// positive statement — return an error, not an empty map, if absence
+// could not be determined, or missing entities get negative-cached. A
+// loader error fails the whole call. A broken cache degrades: read
+// failures make every key load, write failures are best-effort, and
+// undecodable entries self-heal exactly like GetOrSet.
 //
 // Unlike GetOrSet, batch loads are not single-flighted: deduplicating
 // overlapping batches would require per-key flights with partial joins.
@@ -118,25 +119,32 @@ func GetOrSetManyWithCodec[T any](ctx context.Context, c Cache, keys []string, t
 			}
 			continue
 		}
+		result[k] = v
 		data, merr := codec.Marshal(v)
 		if merr != nil {
-			return nil, fmt.Errorf("cachekit: encode %q: %w", k, merr)
+			// Encode failure is a per-key property: the caller still
+			// gets the loaded value, it just isn't cached.
+			cfg.hooks.error(OpEncode, k, merr)
+			continue
 		}
 		vals[k] = data
-		result[k] = v
 	}
 
-	// Best effort: failed writes must not fail the request. Backends
-	// report failures through Hooks.OnError.
+	// Best effort: failed writes must not fail the request (backends
+	// report failures through Hooks.OnError), and — like GetOrSet's
+	// detached flight — a caller canceling after a successful load must
+	// not waste the result, so writes run detached from cancellation.
+	// Per-op timeouts still bound the actual I/O.
+	wctx := context.WithoutCancel(ctx)
 	if batched {
-		_ = bc.SetMany(ctx, vals, ttl)
-		_ = bc.SetMany(ctx, negs, cfg.negativeTTL)
+		_ = bc.SetMany(wctx, vals, ttl)
+		_ = bc.SetMany(wctx, negs, cfg.negativeTTL)
 	} else {
 		for k, data := range vals {
-			_ = c.Set(ctx, k, data, ttl)
+			_ = c.Set(wctx, k, data, ttl)
 		}
 		for k, data := range negs {
-			_ = c.Set(ctx, k, data, cfg.negativeTTL)
+			_ = c.Set(wctx, k, data, cfg.negativeTTL)
 		}
 	}
 	return result, nil

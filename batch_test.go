@@ -142,6 +142,64 @@ func TestGetOrSetManyNegativeCaching(t *testing.T) {
 	}
 }
 
+// failingCodec wraps JSONCodec but refuses to marshal users named "bad".
+type failingCodec struct{ JSONCodec }
+
+func (failingCodec) Marshal(v any) ([]byte, error) {
+	if u, ok := v.(user); ok && u.Name == "bad" {
+		return nil, errors.New("unmarshalable value")
+	}
+	return JSONCodec{}.Marshal(v)
+}
+
+func TestGetOrSetManyEncodeFailureSkipsCachingOnly(t *testing.T) {
+	rec := &hookCounters{}
+	c, _ := newTestCache(t, WithHooks(rec.hooks()))
+	ctx := context.Background()
+
+	got, err := GetOrSetManyWithCodec(ctx, c, []string{"good", "bad"}, time.Minute, failingCodec{},
+		func(_ context.Context, missing []string) (map[string]user, error) {
+			return map[string]user{
+				"good": {ID: 1, Name: "good"},
+				"bad":  {ID: 2, Name: "bad"},
+			}, nil
+		})
+	if err != nil {
+		t.Fatalf("GetOrSetMany: %v", err)
+	}
+	// The caller still gets both values; only caching is skipped for "bad".
+	if len(got) != 2 || got["bad"].ID != 2 {
+		t.Fatalf("result = %+v", got)
+	}
+	if !hasOp(rec.errOps(), OpEncode) {
+		t.Fatalf("OnError(OpEncode) not fired: %v", rec.errOps())
+	}
+	if _, err := c.Get(ctx, "good"); err != nil {
+		t.Fatalf("good not cached: %v", err)
+	}
+	if _, err := c.Get(ctx, "bad"); !IsMiss(err) {
+		t.Fatalf("unencodable value ended up cached: %v", err)
+	}
+}
+
+func TestGetOrSetManyWritesSurviveCallerCancel(t *testing.T) {
+	c, _ := newTestCache(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	got, err := GetOrSetMany(ctx, c, []string{"user:1"}, time.Minute,
+		func(_ context.Context, missing []string) (map[string]user, error) {
+			cancel() // caller gives up right as the load completes
+			return map[string]user{"user:1": {ID: 1, Name: "kept"}}, nil
+		})
+	if err != nil || got["user:1"].ID != 1 {
+		t.Fatalf("GetOrSetMany: %+v, %v", got, err)
+	}
+	// The write phase runs detached from the canceled context.
+	if _, err := c.Get(context.Background(), "user:1"); err != nil {
+		t.Fatalf("loaded value not cached after caller cancel: %v", err)
+	}
+}
+
 func TestGetOrSetManyDecodeFailureSelfHeals(t *testing.T) {
 	c, _ := newTestCache(t)
 	ctx := context.Background()
