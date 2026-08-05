@@ -49,6 +49,23 @@ type Options struct {
 	// not bound GetOrSet loaders. Zero means no per-op deadline. Ignored
 	// by MemoryCache.
 	OpTimeout time.Duration
+	// StaleTTL enables stale-while-revalidate in GetOrSet: after an
+	// entry's freshness TTL passes, it stays servable for this long while
+	// a deduplicated background refresh reloads it — hot keys never pay
+	// loader latency on the request path. Entries are stored in a small
+	// metadata envelope (see envelope.go). GetOrSetMany serves stale
+	// entries but does not background-refresh them; they reload at hard
+	// expiry (freshness TTL + StaleTTL). Zero disables.
+	StaleTTL time.Duration
+	// EarlyRefreshBeta enables probabilistic early refresh (XFetch): as
+	// an entry approaches its freshness deadline, each GetOrSet hit
+	// refreshes it in the background with a probability that rises with
+	// proximity to expiry, scaled by the loader's observed duration.
+	// Because every process rolls independently, a fleet spreads its
+	// reloads instead of stampeding the database at expiry — this is the
+	// cross-instance complement to per-process single-flight. 1.0 is a
+	// sensible default; larger refreshes earlier. Zero disables.
+	EarlyRefreshBeta float64
 }
 
 // Option mutates Options in the functional-options style.
@@ -71,6 +88,10 @@ func WithTTLJitter(fraction float64) Option {
 }
 func WithNegativeTTL(d time.Duration) Option { return func(o *Options) { o.NegativeTTL = d } }
 func WithOpTimeout(d time.Duration) Option   { return func(o *Options) { o.OpTimeout = d } }
+func WithStaleTTL(d time.Duration) Option    { return func(o *Options) { o.StaleTTL = d } }
+func WithEarlyRefresh(beta float64) Option {
+	return func(o *Options) { o.EarlyRefreshBeta = beta }
+}
 
 func buildOptions(opts []Option) Options {
 	o := Options{Addr: "localhost:6379"}
@@ -85,6 +106,9 @@ func buildOptions(opts []Option) Options {
 	}
 	if o.TTLJitter > 0.9 {
 		o.TTLJitter = 0.9
+	}
+	if o.EarlyRefreshBeta < 0 {
+		o.EarlyRefreshBeta = 0
 	}
 	return o
 }

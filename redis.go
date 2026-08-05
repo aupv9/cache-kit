@@ -24,6 +24,8 @@ type RedisCache struct {
 	ttlJitter   float64
 	negativeTTL time.Duration
 	opTimeout   time.Duration
+	staleTTL    time.Duration
+	earlyBeta   float64
 	ownsClient  bool
 }
 
@@ -66,11 +68,19 @@ func newFromClient(client redis.UniversalClient, o Options) *RedisCache {
 		ttlJitter:   o.TTLJitter,
 		negativeTTL: o.NegativeTTL,
 		opTimeout:   o.OpTimeout,
+		staleTTL:    o.StaleTTL,
+		earlyBeta:   o.EarlyRefreshBeta,
 	}
 }
 
 func (c *RedisCache) cachekitConfig() cacheConfig {
-	return cacheConfig{hooks: c.hooks, negativeTTL: c.negativeTTL}
+	return cacheConfig{
+		hooks:            c.hooks,
+		negativeTTL:      c.negativeTTL,
+		defaultTTL:       c.defaultTTL,
+		staleTTL:         c.staleTTL,
+		earlyRefreshBeta: c.earlyBeta,
+	}
 }
 
 // ttlFor resolves the effective TTL for a write: default fallback, then

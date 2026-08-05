@@ -27,7 +27,26 @@ type group struct {
 // for the others (and to populate the cache). The result is forgotten
 // once the call completes so later misses trigger a fresh load.
 func (g *group) do(ctx context.Context, key string, fn func() ([]byte, error)) ([]byte, error) {
-	ch := g.sf.DoChan(key, func() (v any, err error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-g.start(key, fn):
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.([]byte), nil
+	}
+}
+
+// doAsync starts (or joins) a flight without waiting for its result —
+// used for background refreshes. The result channel is buffered, so
+// nothing leaks when nobody reads it.
+func (g *group) doAsync(key string, fn func() ([]byte, error)) {
+	g.start(key, fn)
+}
+
+func (g *group) start(key string, fn func() ([]byte, error)) <-chan singleflight.Result {
+	return g.sf.DoChan(key, func() (v any, err error) {
 		defer g.sf.Forget(key)
 		// A panicking fn under DoChan is re-panicked by singleflight on a
 		// fresh goroutine, where nothing can recover it — a loader panic
@@ -39,13 +58,4 @@ func (g *group) do(ctx context.Context, key string, fn func() ([]byte, error)) (
 		}()
 		return fn()
 	})
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case res := <-ch:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		return res.Val.([]byte), nil
-	}
 }

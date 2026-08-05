@@ -84,6 +84,16 @@ cache := cachekit.New(
     // A slow cache is worse than a down one: bound every cache operation
     // (never the loader) with its own deadline.
     cachekit.WithOpTimeout(50*time.Millisecond),
+
+    // Stale-while-revalidate: after freshness expires, keep serving the
+    // old value for up to 30s while one background refresh reloads it —
+    // hot keys never pay loader latency on the request path.
+    cachekit.WithStaleTTL(30*time.Second),
+
+    // Cross-instance stampede protection (XFetch): as expiry approaches,
+    // each hit refreshes early with rising probability, so a fleet
+    // spreads its reloads instead of hitting the DB simultaneously.
+    cachekit.WithEarlyRefresh(1.0),
 )
 ```
 

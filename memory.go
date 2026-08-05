@@ -25,6 +25,8 @@ type MemoryCache struct {
 	hooks       Hooks
 	ttlJitter   float64
 	negativeTTL time.Duration
+	staleTTL    time.Duration
+	earlyBeta   float64
 	now         func() time.Time // overridable in tests
 }
 
@@ -51,12 +53,20 @@ func NewMemory(opts ...Option) *MemoryCache {
 		hooks:       o.Hooks,
 		ttlJitter:   o.TTLJitter,
 		negativeTTL: o.NegativeTTL,
+		staleTTL:    o.StaleTTL,
+		earlyBeta:   o.EarlyRefreshBeta,
 		now:         time.Now,
 	}
 }
 
 func (c *MemoryCache) cachekitConfig() cacheConfig {
-	return cacheConfig{hooks: c.hooks, negativeTTL: c.negativeTTL}
+	return cacheConfig{
+		hooks:            c.hooks,
+		negativeTTL:      c.negativeTTL,
+		defaultTTL:       c.defaultTTL,
+		staleTTL:         c.staleTTL,
+		earlyRefreshBeta: c.earlyBeta,
+	}
 }
 
 func (c *MemoryCache) key(k string) string { return c.prefix + k }

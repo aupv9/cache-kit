@@ -13,7 +13,15 @@ go vet ./...
 ```
 
 Tests never require a running Redis/Valkey: they use `miniredis.RunT(t)`.
-Do not add tests that dial a real server.
+Do not add tests that dial a real server — except `integration_test.go`
+(build tag `integration`), which exercises the client-side-caching paths
+miniredis cannot (`DoCache`/`DoMultiCache`). Run those with:
+
+```bash
+CACHEKIT_SERVER_ADDR=localhost:6379 go test -race -tags integration -run Integration ./...
+```
+
+CI runs them against a valkey service container.
 
 ## Architecture
 
@@ -25,6 +33,7 @@ Do not add tests that dial a real server.
 | `redis.go`   | `RedisCache` — go-redis v9 backend, works with both Redis and Valkey (RESP) |
 | `valkey.go`  | `ValkeyCache` — valkey-go backend: auto-pipelining, optional server-assisted client-side caching (`WithClientSideCacheTTL`) |
 | `memory.go`  | `MemoryCache` — process-local map, TTL via lazy expiry; tests/dev/L1 only |
+| `envelope.go`| metadata envelope (freshness + loader delta) for SWR/early refresh, XFetch |
 | `codec.go`   | `Codec` interface, `JSONCodec` default |
 | `options.go` | `Options` + functional `With*` options |
 | `hooks.go`   | `Hooks` (OnHit/OnMiss/OnError/OnLoad) — the observability surface |
@@ -77,6 +86,15 @@ be added there.
 - **Batch loads are not single-flighted** (documented in `GetOrSetMany`);
   batch reads degrade to "all missing" on infra failure, batch writes are
   best-effort.
+- **Envelope order**: negative marker check → envelope parse → decode, on
+  every read path. The envelope is written only when `WithStaleTTL` or
+  `WithEarlyRefresh` is set; bare bytes always parse as "no metadata,
+  fresh until backend TTL" (back-compat with pre-envelope entries).
+- **Stale serves never block**: a stale hit returns immediately and
+  triggers `refreshAsync` (deduped through the same single-flight group
+  as misses; failures keep the stale entry). Background refreshes drop
+  the initiator's deadline; synchronous flights keep it. `GetOrSetMany`
+  serves stale without refreshing (hard TTL bounds staleness).
 
 ## Adding a new backend (e.g. valkey-go, in-memory)
 

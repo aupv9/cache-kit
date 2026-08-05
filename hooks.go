@@ -68,8 +68,17 @@ func (h Hooks) load(key string, dur time.Duration, err error) {
 // cacheConfig is the per-cache configuration the GetOrSet helpers need
 // beyond the Cache interface itself.
 type cacheConfig struct {
-	hooks       Hooks
-	negativeTTL time.Duration
+	hooks            Hooks
+	negativeTTL      time.Duration
+	defaultTTL       time.Duration
+	staleTTL         time.Duration
+	earlyRefreshBeta float64
+}
+
+// envelopeEnabled reports whether GetOrSet stores entries with the
+// metadata envelope (needed by stale-while-revalidate and early refresh).
+func (c cacheConfig) envelopeEnabled() bool {
+	return c.staleTTL > 0 || c.earlyRefreshBeta > 0
 }
 
 // configured is implemented by backends so GetOrSet can report loader and

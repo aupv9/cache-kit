@@ -35,6 +35,8 @@ type ValkeyCache struct {
 	ttlJitter      float64
 	negativeTTL    time.Duration
 	opTimeout      time.Duration
+	staleTTL       time.Duration
+	earlyBeta      float64
 	ownsClient     bool
 }
 
@@ -88,11 +90,19 @@ func newValkeyFromClient(client valkey.Client, o Options) *ValkeyCache {
 		ttlJitter:      o.TTLJitter,
 		negativeTTL:    o.NegativeTTL,
 		opTimeout:      o.OpTimeout,
+		staleTTL:       o.StaleTTL,
+		earlyBeta:      o.EarlyRefreshBeta,
 	}
 }
 
 func (c *ValkeyCache) cachekitConfig() cacheConfig {
-	return cacheConfig{hooks: c.hooks, negativeTTL: c.negativeTTL}
+	return cacheConfig{
+		hooks:            c.hooks,
+		negativeTTL:      c.negativeTTL,
+		defaultTTL:       c.defaultTTL,
+		staleTTL:         c.staleTTL,
+		earlyRefreshBeta: c.earlyBeta,
+	}
 }
 
 // ttlFor resolves the effective TTL for a write: default fallback, jitter,

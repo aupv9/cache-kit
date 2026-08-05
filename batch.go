@@ -83,8 +83,12 @@ func GetOrSetManyWithCodec[T any](ctx context.Context, c Cache, keys []string, t
 		if isNegativeEntry(data) {
 			continue // known absent: excluded from the result, not reloaded
 		}
+		// Entries in their stale window are served as-is: batch loads
+		// have no per-key background refresh (see the doc comment); the
+		// hard TTL still bounds staleness.
+		_, payload := parseEnvelope(data)
 		var v T
-		if uerr := codec.Unmarshal(data, &v); uerr != nil {
+		if uerr := codec.Unmarshal(payload, &v); uerr != nil {
 			cfg.hooks.error(OpDecode, k, uerr)
 			_ = c.Delete(ctx, k)
 			missing = append(missing, k)
@@ -98,15 +102,16 @@ func GetOrSetManyWithCodec[T any](ctx context.Context, c Cache, keys []string, t
 
 	start := time.Now()
 	loaded, err := loader(ctx, missing)
-	dur := time.Since(start)
+	loadDur := time.Since(start)
 	for _, k := range missing {
-		cfg.hooks.load(k, dur, err)
+		cfg.hooks.load(k, loadDur, err)
 	}
 	if err != nil {
 		return nil, err
 	}
 
 	vals := make(map[string][]byte, len(loaded))
+	storeTTL := ttl
 	var negs map[string][]byte
 	for _, k := range missing {
 		v, ok := loaded[k]
@@ -120,13 +125,15 @@ func GetOrSetManyWithCodec[T any](ctx context.Context, c Cache, keys []string, t
 			continue
 		}
 		result[k] = v
-		data, merr := codec.Marshal(v)
+		payload, merr := codec.Marshal(v)
 		if merr != nil {
 			// Encode failure is a per-key property: the caller still
 			// gets the loaded value, it just isn't cached.
 			cfg.hooks.error(OpEncode, k, merr)
 			continue
 		}
+		data, packedTTL := packForStore(payload, ttl, loadDur, cfg)
+		storeTTL = packedTTL
 		vals[k] = data
 	}
 
@@ -137,11 +144,11 @@ func GetOrSetManyWithCodec[T any](ctx context.Context, c Cache, keys []string, t
 	// Per-op timeouts still bound the actual I/O.
 	wctx := context.WithoutCancel(ctx)
 	if batched {
-		_ = bc.SetMany(wctx, vals, ttl)
+		_ = bc.SetMany(wctx, vals, storeTTL)
 		_ = bc.SetMany(wctx, negs, cfg.negativeTTL)
 	} else {
 		for k, data := range vals {
-			_ = c.Set(wctx, k, data, ttl)
+			_ = c.Set(wctx, k, data, storeTTL)
 		}
 		for k, data := range negs {
 			_ = c.Set(wctx, k, data, cfg.negativeTTL)
