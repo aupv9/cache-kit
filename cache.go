@@ -70,7 +70,10 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 			return v, nil
 		}
 		// Self-heal: drop the undecodable entry and reload, rather than
-		// returning an error for this key until its TTL expires.
+		// returning an error for this key until its TTL expires. The
+		// Delete can race a concurrent valid write and remove it — the
+		// cost is one wasted load absorbed by the single-flight group,
+		// which is not worth an atomic compare-and-delete.
 		hooks.error(OpDecode, key, uerr)
 		_ = c.Delete(ctx, key)
 	}
@@ -91,10 +94,12 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 		// Another flight may have populated the key while we waited.
 		if data, err := c.Get(fctx, key); err == nil {
 			var probe T
-			if codec.Unmarshal(data, &probe) == nil {
+			uerr := codec.Unmarshal(data, &probe)
+			if uerr == nil {
 				return data, nil
 			}
 			// Concurrently written undecodable entry: same self-heal.
+			hooks.error(OpDecode, key, uerr)
 			_ = c.Delete(fctx, key)
 		}
 
@@ -119,8 +124,10 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 
 	var v T
 	if uerr := codec.Unmarshal(data, &v); uerr != nil {
-		// The flight validated or produced these bytes itself, so this is
-		// a codec Marshal/Unmarshal asymmetry, not cache corruption.
+		// The flight validated or produced these bytes, so this is either
+		// a codec Marshal/Unmarshal asymmetry or a waiter that joined the
+		// flight with a different T/codec than the initiator's — not
+		// cache corruption.
 		return zero, fmt.Errorf("cachekit: decode %q: %w", key, uerr)
 	}
 	return v, nil

@@ -2,6 +2,7 @@ package cachekit
 
 import (
 	"context"
+	"fmt"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -26,8 +27,16 @@ type group struct {
 // for the others (and to populate the cache). The result is forgotten
 // once the call completes so later misses trigger a fresh load.
 func (g *group) do(ctx context.Context, key string, fn func() ([]byte, error)) ([]byte, error) {
-	ch := g.sf.DoChan(key, func() (any, error) {
+	ch := g.sf.DoChan(key, func() (v any, err error) {
 		defer g.sf.Forget(key)
+		// A panicking fn under DoChan is re-panicked by singleflight on a
+		// fresh goroutine, where nothing can recover it — a loader panic
+		// would kill the process. Convert it to an error instead.
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("cachekit: loader panic: %v", r)
+			}
+		}()
 		return fn()
 	})
 	select {

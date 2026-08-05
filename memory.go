@@ -54,20 +54,27 @@ func (c *MemoryCache) key(k string) string { return c.prefix + k }
 
 // Get returns the value at key, or ErrCacheMiss if absent or expired.
 func (c *MemoryCache) Get(_ context.Context, key string) ([]byte, error) {
+	// Hooks fire after unlocking: they run arbitrary user code, which
+	// must not serialize other operations or deadlock by re-entering
+	// this cache (e.g. when it serves as an L1).
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	it, ok := c.items[c.key(key)]
+	if ok && !it.deadline.IsZero() && !c.now().Before(it.deadline) {
+		delete(c.items, c.key(key))
+		ok = false
+	}
+	var val []byte
+	if ok {
+		val = bytes.Clone(it.val)
+	}
+	c.mu.Unlock()
+
 	if !ok {
 		c.hooks.miss(key)
 		return nil, fmt.Errorf("%w: %s", ErrCacheMiss, key)
 	}
-	if !it.deadline.IsZero() && !c.now().Before(it.deadline) {
-		delete(c.items, c.key(key))
-		c.hooks.miss(key)
-		return nil, fmt.Errorf("%w: %s", ErrCacheMiss, key)
-	}
 	c.hooks.hit(key)
-	return bytes.Clone(it.val), nil
+	return val, nil
 }
 
 // Set stores val at key. ttl <= 0 falls back to the configured DefaultTTL;

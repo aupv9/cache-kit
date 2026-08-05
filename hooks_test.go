@@ -3,6 +3,7 @@ package cachekit
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -134,6 +135,28 @@ func TestGetOrSetDecodeFailureSelfHeals(t *testing.T) {
 	})
 	if err != nil || u2 != u || calls != 1 {
 		t.Fatalf("second GetOrSet: %+v, %v, calls = %d", u2, err, calls)
+	}
+}
+
+// singleflight's DoChan re-panics a panicking fn on a fresh goroutine,
+// which no caller can recover — group.do must convert loader panics to
+// errors or one bad loader takes down the whole process.
+func TestGetOrSetLoaderPanicBecomesError(t *testing.T) {
+	c, _ := newTestCache(t)
+
+	_, err := GetOrSet(context.Background(), c, "boom", time.Minute, func(context.Context) (user, error) {
+		panic("loader exploded")
+	})
+	if err == nil || !strings.Contains(err.Error(), "loader panic") {
+		t.Fatalf("err = %v, want loader panic converted to error", err)
+	}
+
+	// The failed flight must not be cached and must not wedge the key.
+	u, err := GetOrSet(context.Background(), c, "boom", time.Minute, func(context.Context) (user, error) {
+		return user{ID: 5, Name: "recovered"}, nil
+	})
+	if err != nil || u.ID != 5 {
+		t.Fatalf("key wedged after panic: %+v, %v", u, err)
 	}
 }
 
