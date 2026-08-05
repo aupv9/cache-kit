@@ -31,6 +31,7 @@ type ValkeyCache struct {
 	defaultTTL     time.Duration
 	codec          Codec
 	clientCacheTTL time.Duration
+	hooks          Hooks
 	ownsClient     bool
 }
 
@@ -77,8 +78,11 @@ func newValkeyFromClient(client valkey.Client, o Options) *ValkeyCache {
 		defaultTTL:     o.DefaultTTL,
 		codec:          o.Codec,
 		clientCacheTTL: o.ClientSideCacheTTL,
+		hooks:          o.Hooks,
 	}
 }
+
+func (c *ValkeyCache) cacheHooks() Hooks { return c.hooks }
 
 func (c *ValkeyCache) key(k string) string { return c.prefix + k }
 
@@ -95,10 +99,13 @@ func (c *ValkeyCache) Get(ctx context.Context, key string) ([]byte, error) {
 	data, err := res.AsBytes()
 	if err != nil {
 		if valkey.IsValkeyNil(err) {
+			c.hooks.miss(key)
 			return nil, fmt.Errorf("%w: %s", ErrCacheMiss, key)
 		}
+		c.hooks.error(OpGet, key, err)
 		return nil, fmt.Errorf("cachekit: get %q: %w", key, err)
 	}
+	c.hooks.hit(key)
 	return data, nil
 }
 
@@ -121,6 +128,7 @@ func (c *ValkeyCache) Set(ctx context.Context, key string, val []byte, ttl time.
 		cmd = b.Build()
 	}
 	if err := c.client.Do(ctx, cmd).Error(); err != nil {
+		c.hooks.error(OpSet, key, err)
 		return fmt.Errorf("cachekit: set %q: %w", key, err)
 	}
 	return nil
@@ -129,6 +137,7 @@ func (c *ValkeyCache) Set(ctx context.Context, key string, val []byte, ttl time.
 // Delete removes key. Deleting a missing key succeeds.
 func (c *ValkeyCache) Delete(ctx context.Context, key string) error {
 	if err := c.client.Do(ctx, c.client.B().Del().Key(c.key(key)).Build()).Error(); err != nil {
+		c.hooks.error(OpDelete, key, err)
 		return fmt.Errorf("cachekit: delete %q: %w", key, err)
 	}
 	return nil

@@ -20,6 +20,7 @@ type RedisCache struct {
 	prefix     string
 	defaultTTL time.Duration
 	codec      Codec
+	hooks      Hooks
 	ownsClient bool
 }
 
@@ -55,8 +56,11 @@ func newFromClient(client redis.UniversalClient, o Options) *RedisCache {
 		prefix:     o.Prefix,
 		defaultTTL: o.DefaultTTL,
 		codec:      o.Codec,
+		hooks:      o.Hooks,
 	}
 }
+
+func (c *RedisCache) cacheHooks() Hooks { return c.hooks }
 
 func (c *RedisCache) key(k string) string { return c.prefix + k }
 
@@ -65,10 +69,13 @@ func (c *RedisCache) Get(ctx context.Context, key string) ([]byte, error) {
 	data, err := c.client.Get(ctx, c.key(key)).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
+			c.hooks.miss(key)
 			return nil, fmt.Errorf("%w: %s", ErrCacheMiss, key)
 		}
+		c.hooks.error(OpGet, key, err)
 		return nil, fmt.Errorf("cachekit: get %q: %w", key, err)
 	}
+	c.hooks.hit(key)
 	return data, nil
 }
 
@@ -79,6 +86,7 @@ func (c *RedisCache) Set(ctx context.Context, key string, val []byte, ttl time.D
 		ttl = c.defaultTTL
 	}
 	if err := c.client.Set(ctx, c.key(key), val, ttl).Err(); err != nil {
+		c.hooks.error(OpSet, key, err)
 		return fmt.Errorf("cachekit: set %q: %w", key, err)
 	}
 	return nil
@@ -87,6 +95,7 @@ func (c *RedisCache) Set(ctx context.Context, key string, val []byte, ttl time.D
 // Delete removes key. Deleting a missing key succeeds.
 func (c *RedisCache) Delete(ctx context.Context, key string) error {
 	if err := c.client.Del(ctx, c.key(key)).Err(); err != nil {
+		c.hooks.error(OpDelete, key, err)
 		return fmt.Errorf("cachekit: delete %q: %w", key, err)
 	}
 	return nil

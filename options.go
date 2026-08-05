@@ -27,20 +27,26 @@ type Options struct {
 	// invalidations on writes. Zero disables it. Ignored by backends
 	// without client-side caching.
 	ClientSideCacheTTL time.Duration
+	// Hooks receives hit/miss/error/loader events for metrics and logging.
+	// See the Hooks type; the zero value disables everything.
+	Hooks Hooks
 }
 
 // Option mutates Options in the functional-options style.
 type Option func(*Options)
 
-func WithAddr(addr string) Option        { return func(o *Options) { o.Addr = addr } }
-func WithAuth(user, pass string) Option  { return func(o *Options) { o.Username, o.Password = user, pass } }
-func WithDB(db int) Option               { return func(o *Options) { o.DB = db } }
-func WithPrefix(prefix string) Option    { return func(o *Options) { o.Prefix = prefix } }
+func WithAddr(addr string) Option { return func(o *Options) { o.Addr = addr } }
+func WithAuth(user, pass string) Option {
+	return func(o *Options) { o.Username, o.Password = user, pass }
+}
+func WithDB(db int) Option                  { return func(o *Options) { o.DB = db } }
+func WithPrefix(prefix string) Option       { return func(o *Options) { o.Prefix = prefix } }
 func WithDefaultTTL(d time.Duration) Option { return func(o *Options) { o.DefaultTTL = d } }
-func WithCodec(c Codec) Option           { return func(o *Options) { o.Codec = c } }
+func WithCodec(c Codec) Option              { return func(o *Options) { o.Codec = c } }
 func WithClientSideCacheTTL(d time.Duration) Option {
 	return func(o *Options) { o.ClientSideCacheTTL = d }
 }
+func WithHooks(h Hooks) Option { return func(o *Options) { o.Hooks = h } }
 
 func buildOptions(opts []Option) Options {
 	o := Options{Addr: "localhost:6379"}

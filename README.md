@@ -60,7 +60,33 @@ Semantics worth knowing:
   connection errors are separate so you know when to fall back to the DB.
 - `GetOrSet` degrades gracefully: if the cache is down it still calls your
   loader and returns the result.
+- A cached entry that fails to decode (corruption, schema change between
+  deploys) is treated as a miss: deleted and reloaded, never a stuck error.
+- Canceling your context while waiting on a shared load returns
+  immediately; the load itself finishes detached and populates the cache.
 - `Set` with `ttl <= 0` uses the configured `DefaultTTL` (or no expiry).
+
+## Observability
+
+Wire `Hooks` to your metrics — especially `OnError`, which also fires for
+errors cachekit swallows by design (the best-effort `Set` after a load).
+Without it, a degraded cache is invisible while your DB absorbs the traffic:
+
+```go
+cache := cachekit.New(
+    cachekit.WithAddr("localhost:6379"),
+    cachekit.WithHooks(cachekit.Hooks{
+        OnHit:   func(key string) { metrics.Hits.Inc() },
+        OnMiss:  func(key string) { metrics.Misses.Inc() },
+        OnError: func(op cachekit.Op, key string, err error) {
+            metrics.Errors.WithLabelValues(string(op)).Inc()
+        },
+        OnLoad: func(key string, dur time.Duration, err error) {
+            metrics.LoaderDuration.Observe(dur.Seconds())
+        },
+    }),
+)
+```
 
 ## Testing
 

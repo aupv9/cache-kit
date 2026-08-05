@@ -38,9 +38,18 @@ func IsMiss(err error) bool {
 // for key, or invokes loader, stores the result, and returns it.
 //
 // Concurrent callers that miss on the same key share a single loader call
-// (see group.go). Infrastructure errors from Get are treated as a miss so
-// the service keeps working when the cache is down; in that degraded mode
-// the loader result is still returned and Set is attempted best-effort.
+// (see group.go). Waiters honor their own context: a canceled waiter
+// returns ctx.Err() immediately without aborting the shared flight. The
+// loader itself runs detached from the initiating caller's cancellation
+// (values and any deadline are kept) so one canceled request cannot fail
+// every waiter or waste a completed load.
+//
+// Infrastructure errors from Get are treated as a miss so the service
+// keeps working when the cache is down; in that degraded mode the loader
+// result is still returned and Set is attempted best-effort. A cached
+// entry that fails to decode (corrupted, or written by an incompatible
+// schema version) is also treated as a miss: the entry is deleted and the
+// loader repopulates it, instead of the key erroring until TTL expiry.
 // Values are encoded with codec (nil means the package default, JSON).
 func GetOrSet[T any](ctx context.Context, c Cache, key string, ttl time.Duration, loader func(context.Context) (T, error)) (T, error) {
 	return GetOrSetWithCodec(ctx, c, key, ttl, defaultCodec, loader)
@@ -52,23 +61,46 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 	if codec == nil {
 		codec = defaultCodec
 	}
+	hooks := hooksOf(c)
 
 	if data, err := c.Get(ctx, key); err == nil {
 		var v T
-		if uerr := codec.Unmarshal(data, &v); uerr != nil {
-			return zero, fmt.Errorf("cachekit: decode %q: %w", key, uerr)
+		uerr := codec.Unmarshal(data, &v)
+		if uerr == nil {
+			return v, nil
 		}
-		return v, nil
+		// Self-heal: drop the undecodable entry and reload, rather than
+		// returning an error for this key until its TTL expires.
+		hooks.error(OpDecode, key, uerr)
+		_ = c.Delete(ctx, key)
 	}
 
 	// Miss (or degraded cache): load through the single-flight group so
 	// only one goroutine per (cache, key) hits the source of truth.
-	data, err := loadGroup.do(flightKey(c, key), func() ([]byte, error) {
-		// Another flight may have populated the key while we waited.
-		if data, err := c.Get(ctx, key); err == nil {
-			return data, nil
+	data, err := loadGroup.do(ctx, flightKey(c, key), func() ([]byte, error) {
+		// The flight outlives any single waiter, so run it on a context
+		// detached from the initiating caller's cancellation. Its values
+		// (tracing metadata) and deadline, if any, are preserved.
+		fctx := context.WithoutCancel(ctx)
+		if deadline, ok := ctx.Deadline(); ok {
+			var cancel context.CancelFunc
+			fctx, cancel = context.WithDeadline(fctx, deadline)
+			defer cancel()
 		}
-		v, err := loader(ctx)
+
+		// Another flight may have populated the key while we waited.
+		if data, err := c.Get(fctx, key); err == nil {
+			var probe T
+			if codec.Unmarshal(data, &probe) == nil {
+				return data, nil
+			}
+			// Concurrently written undecodable entry: same self-heal.
+			_ = c.Delete(fctx, key)
+		}
+
+		start := time.Now()
+		v, err := loader(fctx)
+		hooks.load(key, time.Since(start), err)
 		if err != nil {
 			return nil, err
 		}
@@ -76,8 +108,9 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 		if err != nil {
 			return nil, fmt.Errorf("cachekit: encode %q: %w", key, err)
 		}
-		// Best effort: a failed Set must not fail the request.
-		_ = c.Set(ctx, key, data, ttl)
+		// Best effort: a failed Set must not fail the request. The
+		// backend reports the failure through Hooks.OnError.
+		_ = c.Set(fctx, key, data, ttl)
 		return data, nil
 	})
 	if err != nil {
@@ -86,6 +119,8 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 
 	var v T
 	if uerr := codec.Unmarshal(data, &v); uerr != nil {
+		// The flight validated or produced these bytes itself, so this is
+		// a codec Marshal/Unmarshal asymmetry, not cache corruption.
 		return zero, fmt.Errorf("cachekit: decode %q: %w", key, uerr)
 	}
 	return v, nil

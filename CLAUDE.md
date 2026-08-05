@@ -25,6 +25,7 @@ Do not add tests that dial a real server.
 | `memory.go`  | `MemoryCache` — process-local map, TTL via lazy expiry; tests/dev/L1 only |
 | `codec.go`   | `Codec` interface, `JSONCodec` default |
 | `options.go` | `Options` + functional `With*` options |
+| `hooks.go`   | `Hooks` (OnHit/OnMiss/OnError/OnLoad) — the observability surface |
 | `group.go`   | single-flight dedup for concurrent loads of the same key |
 
 Dependency direction: everything depends on the `Cache` interface in
@@ -47,8 +48,17 @@ be added there.
 - **Cache failures degrade, not fail**: in `GetOrSet`, a broken cache falls
   through to the loader; a failed `Set` after a successful load is swallowed.
   Loader errors always propagate and never poison the cache.
+- **Swallowed errors are observable**: every backend failure — including the
+  best-effort `Set` that `GetOrSet` swallows — must fire `Hooks.OnError`.
+  Any new degradation path needs a hook call, or outages become invisible.
+- **Decode failures self-heal**: a cached entry that fails to decode
+  (corruption, incompatible schema after a deploy) is treated as a miss —
+  `GetOrSet` deletes it and reloads. A key must never error until TTL expiry.
 - **Single-flight**: concurrent `GetOrSet` misses on the same (cache, key)
   share one loader call. Flight keys are namespaced per cache instance.
+  Waiters honor their own context (a canceled waiter returns `ctx.Err()`
+  without aborting the flight); the loader runs on a context detached from
+  the initiator's cancellation but keeps its deadline and values.
 - **Prefixing** happens inside the backend (`RedisCache.key`); public API
   keys are always logical (unprefixed).
 

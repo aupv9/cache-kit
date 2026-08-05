@@ -22,6 +22,7 @@ type MemoryCache struct {
 	prefix     string
 	defaultTTL time.Duration
 	codec      Codec
+	hooks      Hooks
 	now        func() time.Time // overridable in tests
 }
 
@@ -42,9 +43,12 @@ func NewMemory(opts ...Option) *MemoryCache {
 		prefix:     o.Prefix,
 		defaultTTL: o.DefaultTTL,
 		codec:      o.Codec,
+		hooks:      o.Hooks,
 		now:        time.Now,
 	}
 }
+
+func (c *MemoryCache) cacheHooks() Hooks { return c.hooks }
 
 func (c *MemoryCache) key(k string) string { return c.prefix + k }
 
@@ -54,12 +58,15 @@ func (c *MemoryCache) Get(_ context.Context, key string) ([]byte, error) {
 	defer c.mu.Unlock()
 	it, ok := c.items[c.key(key)]
 	if !ok {
+		c.hooks.miss(key)
 		return nil, fmt.Errorf("%w: %s", ErrCacheMiss, key)
 	}
 	if !it.deadline.IsZero() && !c.now().Before(it.deadline) {
 		delete(c.items, c.key(key))
+		c.hooks.miss(key)
 		return nil, fmt.Errorf("%w: %s", ErrCacheMiss, key)
 	}
+	c.hooks.hit(key)
 	return bytes.Clone(it.val), nil
 }
 
