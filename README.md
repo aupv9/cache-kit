@@ -60,7 +60,81 @@ Semantics worth knowing:
   connection errors are separate so you know when to fall back to the DB.
 - `GetOrSet` degrades gracefully: if the cache is down it still calls your
   loader and returns the result.
+- A cached entry that fails to decode (corruption, schema change between
+  deploys) is treated as a miss: deleted and reloaded, never a stuck error.
+- Canceling your context while waiting on a shared load returns
+  immediately; the load itself finishes detached and populates the cache.
 - `Set` with `ttl <= 0` uses the configured `DefaultTTL` (or no expiry).
+
+## Production knobs
+
+```go
+cache := cachekit.New(
+    cachekit.WithAddr("localhost:6379"),
+    cachekit.WithDefaultTTL(5*time.Minute),
+
+    // Avalanche: spread TTLs ±10% so co-written keys don't expire together.
+    cachekit.WithTTLJitter(0.1),
+
+    // Penetration: cache "does not exist" for 30s. Loaders signal it by
+    // returning an error wrapping cachekit.ErrNotFound; GetOrSet then
+    // serves ErrNotFound without touching the DB until the entry expires.
+    cachekit.WithNegativeTTL(30*time.Second),
+
+    // A slow cache is worse than a down one: bound every cache operation
+    // (never the loader) with its own deadline.
+    cachekit.WithOpTimeout(50*time.Millisecond),
+
+    // Stale-while-revalidate: after freshness expires, keep serving the
+    // old value for up to 30s while one background refresh reloads it —
+    // hot keys never pay loader latency on the request path.
+    cachekit.WithStaleTTL(30*time.Second),
+
+    // Cross-instance stampede protection (XFetch): as expiry approaches,
+    // each hit refreshes early with rising probability, so a fleet
+    // spreads its reloads instead of hitting the DB simultaneously.
+    cachekit.WithEarlyRefresh(1.0),
+)
+```
+
+## Batch reads
+
+`GetOrSetMany` loads N keys with one cache round trip (MGET / pipelined)
+and one loader call for whichever keys are missing:
+
+```go
+users, err := cachekit.GetOrSetMany(ctx, cache,
+    []string{"user:1", "user:2", "user:3"}, time.Minute,
+    func(ctx context.Context, missing []string) (map[string]User, error) {
+        return loadUsersFromDB(ctx, missing) // called only for cache misses
+    })
+```
+
+Keys the loader omits are absent from the result (and negative-cached when
+`WithNegativeTTL` is set). Note: batch loads are not single-flighted —
+that protection currently applies to per-key `GetOrSet` only.
+
+## Observability
+
+Wire `Hooks` to your metrics — especially `OnError`, which also fires for
+errors cachekit swallows by design (the best-effort `Set` after a load).
+Without it, a degraded cache is invisible while your DB absorbs the traffic:
+
+```go
+cache := cachekit.New(
+    cachekit.WithAddr("localhost:6379"),
+    cachekit.WithHooks(cachekit.Hooks{
+        OnHit:   func(key string) { metrics.Hits.Inc() },
+        OnMiss:  func(key string) { metrics.Misses.Inc() },
+        OnError: func(op cachekit.Op, key string, err error) {
+            metrics.Errors.WithLabelValues(string(op)).Inc()
+        },
+        OnLoad: func(key string, dur time.Duration, err error) {
+            metrics.LoaderDuration.Observe(dur.Seconds())
+        },
+    }),
+)
+```
 
 ## Testing
 

@@ -31,11 +31,20 @@ type ValkeyCache struct {
 	defaultTTL     time.Duration
 	codec          Codec
 	clientCacheTTL time.Duration
+	hooks          Hooks
+	ttlJitter      float64
+	negativeTTL    time.Duration
+	opTimeout      time.Duration
+	staleTTL       time.Duration
+	earlyBeta      float64
 	ownsClient     bool
 }
 
-// compile-time check
-var _ Cache = (*ValkeyCache)(nil)
+// compile-time checks
+var (
+	_ Cache      = (*ValkeyCache)(nil)
+	_ BatchCache = (*ValkeyCache)(nil)
+)
 
 // NewValkey dials a Valkey/Redis server from Options and returns a cache.
 // The returned cache owns the connection; call Close when done.
@@ -77,7 +86,50 @@ func newValkeyFromClient(client valkey.Client, o Options) *ValkeyCache {
 		defaultTTL:     o.DefaultTTL,
 		codec:          o.Codec,
 		clientCacheTTL: o.ClientSideCacheTTL,
+		hooks:          o.Hooks,
+		ttlJitter:      o.TTLJitter,
+		negativeTTL:    o.NegativeTTL,
+		opTimeout:      o.OpTimeout,
+		staleTTL:       o.StaleTTL,
+		earlyBeta:      o.EarlyRefreshBeta,
 	}
+}
+
+func (c *ValkeyCache) cachekitConfig() cacheConfig {
+	return cacheConfig{
+		hooks:            c.hooks,
+		negativeTTL:      c.negativeTTL,
+		defaultTTL:       c.defaultTTL,
+		staleTTL:         c.staleTTL,
+		earlyRefreshBeta: c.earlyBeta,
+		ttlJitter:        c.ttlJitter,
+	}
+}
+
+// ttlFor resolves the effective TTL for a write: default fallback, jitter
+// (skipped for enveloped values — packForStore already jittered their
+// freshness window), then the PX floor — PX truncates to milliseconds and
+// servers reject "PX 0", so sub-millisecond TTLs round up like go-redis.
+func (c *ValkeyCache) ttlFor(ttl time.Duration, val []byte) time.Duration {
+	if ttl <= 0 {
+		ttl = c.defaultTTL
+	}
+	if !hasEnvelope(val) {
+		ttl = applyJitter(ttl, c.ttlJitter)
+	}
+	if ttl > 0 && ttl < time.Millisecond {
+		ttl = time.Millisecond
+	}
+	return ttl
+}
+
+// setCmd builds a SET with the resolved TTL.
+func (c *ValkeyCache) setCmd(key string, val []byte, ttl time.Duration) valkey.Completed {
+	b := c.client.B().Set().Key(c.key(key)).Value(valkey.BinaryString(val))
+	if ttl = c.ttlFor(ttl, val); ttl > 0 {
+		return b.Px(ttl).Build()
+	}
+	return b.Build()
 }
 
 func (c *ValkeyCache) key(k string) string { return c.prefix + k }
@@ -86,6 +138,8 @@ func (c *ValkeyCache) key(k string) string { return c.prefix + k }
 // client-side cache TTL configured, the read is served from the local
 // cache when possible.
 func (c *ValkeyCache) Get(ctx context.Context, key string) ([]byte, error) {
+	ctx, cancel := opContext(ctx, c.opTimeout)
+	defer cancel()
 	var res valkey.ValkeyResult
 	if c.clientCacheTTL > 0 {
 		res = c.client.DoCache(ctx, c.client.B().Get().Key(c.key(key)).Cache(), c.clientCacheTTL)
@@ -95,32 +149,23 @@ func (c *ValkeyCache) Get(ctx context.Context, key string) ([]byte, error) {
 	data, err := res.AsBytes()
 	if err != nil {
 		if valkey.IsValkeyNil(err) {
+			c.hooks.miss(key)
 			return nil, fmt.Errorf("%w: %s", ErrCacheMiss, key)
 		}
+		c.hooks.error(OpGet, key, err)
 		return nil, fmt.Errorf("cachekit: get %q: %w", key, err)
 	}
+	c.hooks.hit(key)
 	return data, nil
 }
 
 // Set stores val at key. ttl <= 0 falls back to the configured DefaultTTL;
 // if that is also zero the key never expires.
 func (c *ValkeyCache) Set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
-	if ttl <= 0 {
-		ttl = c.defaultTTL
-	}
-	// PX truncates to milliseconds; a sub-millisecond TTL would become
-	// "PX 0", which servers reject. Round up like go-redis does.
-	if ttl > 0 && ttl < time.Millisecond {
-		ttl = time.Millisecond
-	}
-	b := c.client.B().Set().Key(c.key(key)).Value(valkey.BinaryString(val))
-	var cmd valkey.Completed
-	if ttl > 0 {
-		cmd = b.Px(ttl).Build()
-	} else {
-		cmd = b.Build()
-	}
-	if err := c.client.Do(ctx, cmd).Error(); err != nil {
+	ctx, cancel := opContext(ctx, c.opTimeout)
+	defer cancel()
+	if err := c.client.Do(ctx, c.setCmd(key, val, ttl)).Error(); err != nil {
+		c.hooks.error(OpSet, key, err)
 		return fmt.Errorf("cachekit: set %q: %w", key, err)
 	}
 	return nil
@@ -128,7 +173,10 @@ func (c *ValkeyCache) Set(ctx context.Context, key string, val []byte, ttl time.
 
 // Delete removes key. Deleting a missing key succeeds.
 func (c *ValkeyCache) Delete(ctx context.Context, key string) error {
+	ctx, cancel := opContext(ctx, c.opTimeout)
+	defer cancel()
 	if err := c.client.Do(ctx, c.client.B().Del().Key(c.key(key)).Build()).Error(); err != nil {
+		c.hooks.error(OpDelete, key, err)
 		return fmt.Errorf("cachekit: delete %q: %w", key, err)
 	}
 	return nil
@@ -139,10 +187,91 @@ func (c *ValkeyCache) Codec() Codec { return c.codec }
 
 // Ping verifies connectivity, for health checks.
 func (c *ValkeyCache) Ping(ctx context.Context) error {
+	ctx, cancel := opContext(ctx, c.opTimeout)
+	defer cancel()
 	if err := c.client.Do(ctx, c.client.B().Ping().Build()).Error(); err != nil {
 		return fmt.Errorf("cachekit: ping: %w", err)
 	}
 	return nil
+}
+
+// GetMany returns the values stored at keys in one auto-pipelined round
+// trip (through the client-side cache when WithClientSideCacheTTL is
+// set, like Get). Missing keys are simply absent from the result map.
+func (c *ValkeyCache) GetMany(ctx context.Context, keys []string) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+	ctx, cancel := opContext(ctx, c.opTimeout)
+	defer cancel()
+
+	var results []valkey.ValkeyResult
+	if c.clientCacheTTL > 0 {
+		cmds := make([]valkey.CacheableTTL, len(keys))
+		for i, k := range keys {
+			cmds[i] = valkey.CT(c.client.B().Get().Key(c.key(k)).Cache(), c.clientCacheTTL)
+		}
+		results = c.client.DoMultiCache(ctx, cmds...)
+	} else {
+		cmds := make([]valkey.Completed, len(keys))
+		for i, k := range keys {
+			cmds[i] = c.client.B().Get().Key(c.key(k)).Build()
+		}
+		results = c.client.DoMulti(ctx, cmds...)
+	}
+
+	// Consume every result before failing so hit/miss hooks fire per key
+	// (matching RedisCache.GetMany's per-key error accounting) — DoMulti
+	// has already paid for all responses.
+	var firstErr error
+	for i, res := range results {
+		data, err := res.AsBytes()
+		if err != nil {
+			if valkey.IsValkeyNil(err) {
+				c.hooks.miss(keys[i])
+				continue
+			}
+			c.hooks.error(OpGet, keys[i], err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("cachekit: get %q: %w", keys[i], err)
+			}
+			continue
+		}
+		c.hooks.hit(keys[i])
+		out[keys[i]] = data
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
+}
+
+// SetMany stores all items in one auto-pipelined round trip, applying the
+// same TTL (after default fallback and jitter, per key) to each.
+func (c *ValkeyCache) SetMany(ctx context.Context, items map[string][]byte, ttl time.Duration) error {
+	if len(items) == 0 {
+		return nil
+	}
+	ctx, cancel := opContext(ctx, c.opTimeout)
+	defer cancel()
+
+	ks := make([]string, 0, len(items))
+	cmds := make([]valkey.Completed, 0, len(items))
+	for k, v := range items {
+		ks = append(ks, k)
+		cmds = append(cmds, c.setCmd(k, v, ttl))
+	}
+	var firstErr error
+	for i, res := range c.client.DoMulti(ctx, cmds...) {
+		if err := res.Error(); err != nil {
+			c.hooks.error(OpSet, ks[i], err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("cachekit: set %q: %w", ks[i], err)
+			}
+		}
+	}
+	return firstErr
 }
 
 // Close releases the underlying client if this cache created it

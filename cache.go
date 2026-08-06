@@ -38,10 +38,34 @@ func IsMiss(err error) bool {
 // for key, or invokes loader, stores the result, and returns it.
 //
 // Concurrent callers that miss on the same key share a single loader call
-// (see group.go). Infrastructure errors from Get are treated as a miss so
-// the service keeps working when the cache is down; in that degraded mode
-// the loader result is still returned and Set is attempted best-effort.
-// Values are encoded with codec (nil means the package default, JSON).
+// (see group.go). Waiters honor their own context: a canceled waiter
+// returns ctx.Err() immediately without aborting the shared flight. The
+// loader itself runs detached from the initiating caller's cancellation
+// (values and any deadline are kept) so one canceled request cannot fail
+// every waiter or waste a completed load.
+//
+// Infrastructure errors from Get are treated as a miss so the service
+// keeps working when the cache is down; in that degraded mode the loader
+// result is still returned and Set is attempted best-effort. A cached
+// entry that fails to decode (corrupted, or written by an incompatible
+// schema version) is also treated as a miss: the entry is deleted and the
+// loader repopulates it, instead of the key erroring until TTL expiry.
+//
+// If the loader returns an error wrapping ErrNotFound and the cache is
+// configured with WithNegativeTTL, the absence itself is cached: further
+// calls return ErrNotFound without invoking the loader until the negative
+// entry expires.
+//
+// With WithStaleTTL, an entry past its freshness TTL is still served —
+// immediately, with no loader latency — while a deduplicated background
+// refresh replaces it (stale-while-revalidate). With WithEarlyRefresh,
+// entries approaching their freshness deadline are probabilistically
+// refreshed in the background before they expire, spreading reloads
+// across time and across instances (XFetch). Both features store entries
+// in a small metadata envelope; entries written without one (older
+// deploys, raw Set calls) are treated as fresh until their backend TTL
+// expires. Values are encoded with codec (nil means the package default,
+// JSON).
 func GetOrSet[T any](ctx context.Context, c Cache, key string, ttl time.Duration, loader func(context.Context) (T, error)) (T, error) {
 	return GetOrSetWithCodec(ctx, c, key, ttl, defaultCodec, loader)
 }
@@ -52,43 +76,218 @@ func GetOrSetWithCodec[T any](ctx context.Context, c Cache, key string, ttl time
 	if codec == nil {
 		codec = defaultCodec
 	}
+	cfg := configOf(c)
+	hooks := cfg.hooks
 
 	if data, err := c.Get(ctx, key); err == nil {
-		var v T
-		if uerr := codec.Unmarshal(data, &v); uerr != nil {
-			return zero, fmt.Errorf("cachekit: decode %q: %w", key, uerr)
+		if isNegativeEntry(data) {
+			return zero, fmt.Errorf("%w: %s", ErrNotFound, key)
 		}
-		return v, nil
+		env, payload := cfg.parseStored(data)
+		var v T
+		uerr := codec.Unmarshal(payload, &v)
+		if uerr == nil {
+			now := time.Now()
+			switch {
+			case env.stale(now):
+				// Stale-while-revalidate: serve the stale value with no
+				// loader latency on the request path; a deduplicated
+				// background refresh replaces the entry.
+				refreshAsync(ctx, c, key, ttl, codec, loader, cfg, env)
+			case env.shouldEarlyRefresh(now, cfg.earlyRefreshBeta):
+				// Probabilistic early refresh near the freshness
+				// deadline: spreads reloads across time and instances.
+				refreshAsync(ctx, c, key, ttl, codec, loader, cfg, env)
+			}
+			return v, nil
+		}
+		// Self-heal: drop the undecodable entry and reload, rather than
+		// returning an error for this key until its TTL expires. The
+		// Delete can race a concurrent valid write and remove it — the
+		// cost is one wasted load absorbed by the single-flight group,
+		// which is not worth an atomic compare-and-delete.
+		hooks.error(OpDecode, key, uerr)
+		_ = c.Delete(ctx, key)
 	}
 
 	// Miss (or degraded cache): load through the single-flight group so
-	// only one goroutine per (cache, key) hits the source of truth.
-	data, err := loadGroup.do(flightKey(c, key), func() ([]byte, error) {
-		// Another flight may have populated the key while we waited.
-		if data, err := c.Get(ctx, key); err == nil {
-			return data, nil
-		}
-		v, err := loader(ctx)
-		if err != nil {
-			return nil, err
-		}
-		data, err := codec.Marshal(v)
-		if err != nil {
-			return nil, fmt.Errorf("cachekit: encode %q: %w", key, err)
-		}
-		// Best effort: a failed Set must not fail the request.
-		_ = c.Set(ctx, key, data, ttl)
-		return data, nil
-	})
+	// only one goroutine per (cache, key) hits the source of truth. The
+	// flight is detached from the initiator's cancellation but keeps its
+	// deadline.
+	data, err := loadGroup.do(ctx, flightKey(c, key),
+		loadAndStore(ctx, c, key, ttl, codec, loader, cfg, flightOpts{preserveDeadline: true}))
 	if err != nil {
 		return zero, err
 	}
+	if isNegativeEntry(data) {
+		return zero, fmt.Errorf("%w: %s", ErrNotFound, key)
+	}
 
+	_, payload := cfg.parseStored(data)
 	var v T
-	if uerr := codec.Unmarshal(data, &v); uerr != nil {
+	if uerr := codec.Unmarshal(payload, &v); uerr != nil {
+		// The flight validated or produced these bytes, so this is either
+		// a codec Marshal/Unmarshal asymmetry or a waiter that joined the
+		// flight with a different T/codec than the initiator's — not
+		// cache corruption.
 		return zero, fmt.Errorf("cachekit: decode %q: %w", key, uerr)
 	}
 	return v, nil
+}
+
+// flightOpts controls how a loadAndStore flight derives its context and
+// when a re-checked entry satisfies it.
+type flightOpts struct {
+	// preserveDeadline keeps the initiator's deadline (synchronous miss
+	// path). Background refreshes leave it false so they aren't cut
+	// short by the request that happened to trigger them.
+	preserveDeadline bool
+	// timeout bounds the flight with its own deadline (background
+	// refreshes; zero means none). Without it a hung loader would pin
+	// its goroutine forever and every stale hit would join the stuck
+	// flight, growing memory without bound.
+	timeout time.Duration
+	// refreshOf is the freshness deadline of the entry that triggered a
+	// refresh flight: the re-check only satisfies the flight if it finds
+	// a strictly fresher entry (someone else already refreshed). Zero —
+	// the miss path — accepts any fresh entry. Without this, an early
+	// refresh would find its own still-fresh entry and become a no-op.
+	refreshOf time.Time
+}
+
+// loadAndStore builds the single-flight function shared by the miss path
+// and background refreshes: re-check the cache, run the loader, store the
+// result (enveloped when stale-while-revalidate / early refresh is on),
+// and return the stored bytes.
+//
+// The returned function derives its own context from base when it runs:
+// detached from cancellation, keeping values, with the deadline governed
+// by opts.
+func loadAndStore[T any](base context.Context, c Cache, key string, ttl time.Duration, codec Codec, loader func(context.Context) (T, error), cfg cacheConfig, opts flightOpts) func() ([]byte, error) {
+	return func() ([]byte, error) {
+		fctx := context.WithoutCancel(base)
+		if opts.preserveDeadline {
+			if deadline, ok := base.Deadline(); ok {
+				var cancel context.CancelFunc
+				fctx, cancel = context.WithDeadline(fctx, deadline)
+				defer cancel()
+			}
+		}
+		if opts.timeout > 0 {
+			var cancel context.CancelFunc
+			fctx, cancel = context.WithTimeout(fctx, opts.timeout)
+			defer cancel()
+		}
+
+		// Another flight may have populated the key while we waited. A
+		// stale entry never satisfies the flight — refreshing it is
+		// exactly this flight's job — and a refresh flight additionally
+		// requires an entry fresher than the one that triggered it.
+		if data, err := c.Get(fctx, key); err == nil {
+			if isNegativeEntry(data) {
+				return data, nil // resolved after the flight
+			}
+			env, payload := cfg.parseStored(data)
+			refreshed := opts.refreshOf.IsZero() || env.freshUntil.After(opts.refreshOf)
+			if !env.stale(time.Now()) && refreshed {
+				var probe T
+				uerr := codec.Unmarshal(payload, &probe)
+				if uerr == nil {
+					return data, nil
+				}
+				// Concurrently written undecodable entry: same self-heal.
+				cfg.hooks.error(OpDecode, key, uerr)
+				_ = c.Delete(fctx, key)
+			}
+		}
+
+		start := time.Now()
+		v, err := loader(fctx)
+		loadDur := time.Since(start)
+		cfg.hooks.load(key, loadDur, err)
+		if err != nil {
+			// Negative caching: "does not exist" is a valid, cacheable
+			// answer — store it so hot lookups of nonexistent entities
+			// stop reaching the database. Other loader errors propagate
+			// and are never cached.
+			if cfg.negativeTTL > 0 && errors.Is(err, ErrNotFound) {
+				_ = c.Set(fctx, key, negativeMarker, cfg.negativeTTL)
+				return negativeMarker, nil
+			}
+			return nil, err
+		}
+		payload, merr := codec.Marshal(v)
+		if merr != nil {
+			cfg.hooks.error(OpEncode, key, merr)
+			return nil, fmt.Errorf("cachekit: encode %q: %w", key, merr)
+		}
+		data, storeTTL := packForStore(payload, ttl, loadDur, cfg)
+		// Best effort: a failed Set must not fail the request. The
+		// backend reports the failure through Hooks.OnError.
+		_ = c.Set(fctx, key, data, storeTTL)
+		return data, nil
+	}
+}
+
+// refreshAsync starts (or joins) a background refresh flight for the
+// entry described by env. It never blocks: concurrent triggers share one
+// loader call through the same single-flight group as the miss path.
+// Failures leave the existing (stale) entry in place until hard expiry
+// and are reported through Hooks.OnError with OpRefresh — nothing waits
+// on these flights, so that hook is their only visibility.
+func refreshAsync[T any](ctx context.Context, c Cache, key string, ttl time.Duration, codec Codec, loader func(context.Context) (T, error), cfg cacheConfig, env envelope) {
+	// Bound the flight by the entry's total lifetime: past hard expiry a
+	// plain miss would reload anyway, so a slower refresh helps nobody.
+	fresh := ttl
+	if fresh <= 0 {
+		fresh = cfg.defaultTTL
+	}
+	timeout := fresh + cfg.staleTTL
+	if timeout <= 0 {
+		timeout = time.Minute // never-expiring entries still get a bound
+	}
+	inner := loadAndStore(ctx, c, key, ttl, codec, loader, cfg,
+		flightOpts{timeout: timeout, refreshOf: env.freshUntil})
+	loadGroup.doAsync(flightKey(c, key), func() (data []byte, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("cachekit: loader panic: %v", r)
+			}
+			if err != nil {
+				cfg.hooks.error(OpRefresh, key, err)
+			}
+		}()
+		return inner()
+	})
+}
+
+// packForStore decides what bytes and TTL actually hit the backend. With
+// stale-while-revalidate or early refresh enabled, the payload is wrapped
+// in the metadata envelope and the backend TTL is extended to freshness +
+// stale window; otherwise both pass through untouched.
+//
+// TTL jitter is applied to the freshness window here — not by the backend
+// on the total — so that "freshUntil + staleTTL == backend expiry" holds
+// exactly: jittering the total could shrink it below freshUntil and
+// silently delete the stale window. Backends skip jitter for enveloped
+// values (hasEnvelope); jittering fresh also spreads the refresh burst of
+// co-written keys, not just their hard expiry.
+func packForStore(payload []byte, ttl, loadDur time.Duration, cfg cacheConfig) ([]byte, time.Duration) {
+	if !cfg.envelopeEnabled() {
+		return payload, ttl
+	}
+	fresh := ttl
+	if fresh <= 0 {
+		fresh = cfg.defaultTTL
+	}
+	fresh = applyJitter(fresh, cfg.ttlJitter)
+	var freshUntil time.Time
+	var total time.Duration
+	if fresh > 0 {
+		freshUntil = time.Now().Add(fresh)
+		total = fresh + cfg.staleTTL
+	}
+	return wrapEnvelope(payload, freshUntil, loadDur), total
 }
 
 // flightKey namespaces single-flight keys per cache instance so two caches

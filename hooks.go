@@ -1,0 +1,117 @@
+package cachekit
+
+import "time"
+
+// Op identifies which cache operation an OnError hook fires for.
+type Op string
+
+const (
+	OpGet    Op = "get"
+	OpSet    Op = "set"
+	OpDelete Op = "delete"
+	// OpDecode fires when a cached entry fails to decode (corrupted or
+	// written by an incompatible schema version). GetOrSet self-heals by
+	// deleting the entry and falling back to the loader.
+	OpDecode Op = "decode"
+	// OpEncode fires when a loaded value fails to encode. GetOrSetMany
+	// still returns the value to the caller — it just isn't cached.
+	OpEncode Op = "encode"
+	// OpRefresh fires when a background refresh flight (stale-while-
+	// revalidate or early refresh) fails for any reason — loader error,
+	// encode failure, panic, or timeout. Nothing waits on these flights,
+	// so this hook is the only place their failures are visible.
+	OpRefresh Op = "refresh"
+)
+
+// Hooks receives cache events, for wiring metrics (hit ratio, error
+// counters, loader latency) and logging. The zero value is valid and
+// disables everything; individual callbacks may be nil.
+//
+// Callbacks run synchronously on the request path and may be invoked
+// concurrently — keep them fast and thread-safe (atomic counters, not
+// blocking I/O).
+type Hooks struct {
+	// OnHit / OnMiss fire on every Get, keyed by the logical key.
+	OnHit  func(key string)
+	OnMiss func(key string)
+	// OnError fires for every backend failure — including errors cachekit
+	// swallows by design, such as the best-effort Set after a load in
+	// GetOrSet. Wire this to a counter or a degraded cache stays invisible.
+	OnError func(op Op, key string, err error)
+	// OnLoad fires after every GetOrSet loader invocation with its
+	// duration and outcome. Loader calls are the cache's whole reason to
+	// exist — this is the number to alert on. For batch loads
+	// (GetOrSetMany) it fires once per missing key, all with the batch's
+	// duration and outcome.
+	OnLoad func(key string, dur time.Duration, err error)
+}
+
+func (h Hooks) hit(key string) {
+	if h.OnHit != nil {
+		h.OnHit(key)
+	}
+}
+
+func (h Hooks) miss(key string) {
+	if h.OnMiss != nil {
+		h.OnMiss(key)
+	}
+}
+
+func (h Hooks) error(op Op, key string, err error) {
+	if h.OnError != nil {
+		h.OnError(op, key, err)
+	}
+}
+
+func (h Hooks) load(key string, dur time.Duration, err error) {
+	if h.OnLoad != nil {
+		h.OnLoad(key, dur, err)
+	}
+}
+
+// cacheConfig is the per-cache configuration the GetOrSet helpers need
+// beyond the Cache interface itself.
+type cacheConfig struct {
+	hooks            Hooks
+	negativeTTL      time.Duration
+	defaultTTL       time.Duration
+	staleTTL         time.Duration
+	earlyRefreshBeta float64
+	ttlJitter        float64
+}
+
+// envelopeEnabled reports whether GetOrSet stores entries with the
+// metadata envelope (needed by stale-while-revalidate and early refresh).
+func (c cacheConfig) envelopeEnabled() bool {
+	return c.staleTTL > 0 || c.earlyRefreshBeta > 0
+}
+
+// parseStored splits stored bytes into metadata and payload. Envelope
+// parsing is gated on the feature being enabled: a cache that never opted
+// in must treat every byte of the value as payload, even ones that happen
+// to start with the envelope magic. (Consequence: disabling SWR/early
+// refresh after enabling it makes old enveloped entries fail decode and
+// self-heal — they are deleted and reloaded once.)
+func (c cacheConfig) parseStored(data []byte) (envelope, []byte) {
+	if !c.envelopeEnabled() {
+		return envelope{}, data
+	}
+	return parseEnvelope(data)
+}
+
+// configured is implemented by backends so GetOrSet can report loader and
+// decode events through the same Hooks the backend was configured with,
+// and honor cache-level settings like the negative-caching TTL.
+type configured interface {
+	cachekitConfig() cacheConfig
+}
+
+// configOf returns c's configuration, or a zero value (no-op hooks,
+// negative caching off) for third-party Cache implementations.
+func configOf(c Cache) cacheConfig {
+	if p, ok := c.(configured); ok {
+		return p.cachekitConfig()
+	}
+	return cacheConfig{}
+}
