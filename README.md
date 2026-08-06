@@ -172,3 +172,9 @@ fits and the rest of your code doesn't change:
 
 All backends pass the same conformance suite (`conformance_test.go`). To
 add another one, see `.claude/skills/add-backend/`.
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) — next up: release discipline (semver,
+benchmarks, lint), then tiered L1+L2 caching, then distributed loading
+semantics.
