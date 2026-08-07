@@ -1,0 +1,66 @@
+# Test app: a service that uses cache-kit against the in-cluster Valkey
+# cluster. Image is built locally and loaded with `k3d image import`, so
+# imagePullPolicy is Never (no registry involved).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cachekit-testapp
+  namespace: cache-kit
+  labels:
+    app: cachekit-testapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cachekit-testapp
+  template:
+    metadata:
+      labels:
+        app: cachekit-testapp
+    spec:
+      containers:
+        - name: testapp
+          image: cachekit-testapp:dev
+          imagePullPolicy: Never
+          env:
+            # Seed for the go-redis cluster client. One seed is enough — the
+            # client discovers the rest via CLUSTER SLOTS (returns hostnames).
+            - name: CACHEKIT_SERVER_ADDR
+              value: valkey-cluster-headless.cache-kit.svc.cluster.local:6379
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cachekit-testapp
+  namespace: cache-kit
+  labels:
+    app: cachekit-testapp
+spec:
+  selector:
+    app: cachekit-testapp
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

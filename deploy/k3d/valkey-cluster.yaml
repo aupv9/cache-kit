@@ -1,0 +1,132 @@
+# Valkey 8 in cluster mode: 6 nodes (3 masters + 3 replicas), ephemeral.
+# Nodes announce their stable pod DNS name (cluster-preferred-endpoint-type
+# hostname) so CLUSTER SLOTS returns hostnames the in-cluster client can dial
+# even after pods get new IPs. Storage is emptyDir: a full StatefulSet restart
+# wipes the cluster — re-run the bootstrap Job to reform it.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cache-kit
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: valkey-cluster-config
+  namespace: cache-kit
+data:
+  valkey.conf: |
+    port 6379
+    cluster-enabled yes
+    cluster-config-file /data/nodes.conf
+    cluster-node-timeout 5000
+    cluster-preferred-endpoint-type hostname
+    # Ephemeral cache node: no RDB, no AOF.
+    save ""
+    appendonly no
+    # In-cluster only, no auth (matches CI). Do NOT expose to the host.
+    protected-mode no
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+---
+# Headless service gives each pod a stable DNS name:
+#   valkey-cluster-<n>.valkey-cluster-headless.cache-kit.svc.cluster.local
+# publishNotReadyAddresses lets those names resolve during bootstrap.
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-cluster-headless
+  namespace: cache-kit
+  labels:
+    app: valkey-cluster
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: valkey-cluster
+  ports:
+    - name: client
+      port: 6379
+      targetPort: 6379
+    - name: gossip
+      port: 16379
+      targetPort: 16379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: valkey-cluster
+  namespace: cache-kit
+  labels:
+    app: valkey-cluster
+spec:
+  serviceName: valkey-cluster-headless
+  replicas: 6
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: valkey-cluster
+  template:
+    metadata:
+      labels:
+        app: valkey-cluster
+    spec:
+      terminationGracePeriodSeconds: 10
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: valkey-cluster
+      containers:
+        - name: valkey
+          image: valkey/valkey:8
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              exec valkey-server /etc/valkey/valkey.conf \
+                --cluster-announce-hostname "${POD_NAME}.valkey-cluster-headless.cache-kit.svc.cluster.local"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: client
+              containerPort: 6379
+            - name: gossip
+              containerPort: 16379
+          volumeMounts:
+            - name: config
+              mountPath: /etc/valkey
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["valkey-cli", "-p", "6379", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["valkey-cli", "-p", "6379", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 384Mi
+      volumes:
+        - name: config
+          configMap:
+            name: valkey-cluster-config
+        - name: data
+          emptyDir: {}

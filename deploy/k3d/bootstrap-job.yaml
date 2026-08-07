@@ -1,0 +1,45 @@
+# Forms the Valkey cluster once all 6 pods answer PING.
+# Idempotent: if the cluster is already ok, it exits without re-creating.
+# --cluster-replicas 1 => 3 masters, each with 1 replica.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: valkey-cluster-bootstrap
+  namespace: cache-kit
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          image: valkey/valkey:8
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              DOMAIN="valkey-cluster-headless.cache-kit.svc.cluster.local"
+              SEED="valkey-cluster-0.${DOMAIN}"
+              NODES=""
+              for i in 0 1 2 3 4 5; do
+                host="valkey-cluster-${i}.${DOMAIN}"
+                echo "waiting for ${host} ..."
+                until valkey-cli -h "${host}" -p 6379 ping 2>/dev/null | grep -q PONG; do
+                  sleep 2
+                done
+                NODES="${NODES} ${host}:6379"
+              done
+
+              state="$(valkey-cli -h "${SEED}" -p 6379 cluster info | tr -d '\r' | awk -F: '/cluster_state/{print $2}')"
+              if [ "${state}" = "ok" ]; then
+                echo "cluster already formed (cluster_state:ok) — nothing to do"
+                exit 0
+              fi
+
+              echo "creating cluster on:${NODES}"
+              # shellcheck disable=SC2086
+              valkey-cli --cluster create ${NODES} --cluster-replicas 1 --cluster-yes
+              echo "---- cluster info ----"
+              valkey-cli -h "${SEED}" -p 6379 cluster info | tr -d '\r'

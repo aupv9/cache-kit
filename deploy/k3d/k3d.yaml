@@ -1,0 +1,17 @@
+# k3d cluster for cache-kit local infra.
+#   k3d cluster create --config k3d.yaml
+# The consuming app and the Valkey cluster both run inside this k3d cluster,
+# so no host port-mapping is needed for Valkey (in-cluster DNS is used).
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: cache-kit
+servers: 1
+agents: 2
+options:
+  k3d:
+    wait: true
+    timeout: "120s"
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true

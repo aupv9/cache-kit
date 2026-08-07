@@ -1,0 +1,3 @@
+.git
+deploy/k3d/testapp/testapp
+**/*_test.go
